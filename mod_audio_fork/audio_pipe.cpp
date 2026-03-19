@@ -251,7 +251,24 @@ int AudioPipe::lws_callback(struct lws *wsi,
           return -1;
         }
 
-        // check for audio packets
+        // check for individual binary packets (OPUS frames)
+        {
+          std::lock_guard<std::mutex> lk(ap->m_audio_mutex);
+          if (!ap->m_binary_packet_queue.empty()) {
+            auto& packet = ap->m_binary_packet_queue.front();
+            size_t pktLen = packet.size();
+            std::vector<uint8_t> buf(pktLen + LWS_PRE);
+            memcpy(buf.data() + LWS_PRE, packet.data(), pktLen);
+            ap->m_binary_packet_queue.pop();
+            lws_write(wsi, buf.data() + LWS_PRE, pktLen, LWS_WRITE_BINARY);
+            if (!ap->m_binary_packet_queue.empty() || ap->m_audio_buffer_write_offset > LWS_PRE) {
+              lws_callback_on_writable(wsi);
+            }
+            return 0;
+          }
+        }
+
+        // check for audio packets (PCM flat buffer)
         {
           std::lock_guard<std::mutex> lk(ap->m_audio_mutex);
           if (ap->m_audio_buffer_write_offset > LWS_PRE) {
@@ -538,6 +555,15 @@ void AudioPipe::bufferForSending(const char* text) {
 void AudioPipe::unlockAudioBuffer() {
   if (m_audio_buffer_write_offset > LWS_PRE) addPendingWrite(this);
   m_audio_mutex.unlock();
+}
+
+void AudioPipe::queueBinaryPacket(const uint8_t* data, size_t len) {
+  if (m_state != LWS_CLIENT_CONNECTED) return;
+  {
+    std::lock_guard<std::mutex> lk(m_audio_mutex);
+    m_binary_packet_queue.push(std::vector<uint8_t>(data, data + len));
+  }
+  addPendingWrite(this);
 }
 
 void AudioPipe::close() {
