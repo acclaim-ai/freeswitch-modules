@@ -22,9 +22,14 @@ CXX       ?= g++
 PKG_CFLAGS := $(shell pkg-config --cflags libwebsockets opus)
 PKG_LIBS   := $(shell pkg-config --libs   libwebsockets opus)
 
-SIMD_FLAGS := -msse2 -DUSE_SSE2
-ifeq ($(AVX2),1)
-    SIMD_FLAGS := -mavx2 -DUSE_AVX2
+# SIMD only applies on x86_64; other arches fall back to the scalar code path.
+ARCH      := $(shell uname -m)
+SIMD_FLAGS :=
+ifneq (,$(filter $(ARCH),x86_64 amd64))
+    SIMD_FLAGS := -msse2 -DUSE_SSE2
+    ifeq ($(AVX2),1)
+        SIMD_FLAGS := -mavx2 -DUSE_AVX2
+    endif
 endif
 
 COMMON_FLAGS := -fPIC -O2 -Wall -I$(FS_INC) $(PKG_CFLAGS) $(SIMD_FLAGS)
