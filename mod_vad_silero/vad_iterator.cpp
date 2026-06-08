@@ -1,7 +1,25 @@
 #include "vad_iterator.h"
+#include <mutex>
 
-// Static method for one-time initialization
+// Process-global ONNX resources, shared by every VadIterator instance. The model
+// is read from disk and the inference graph built exactly once (in global_init),
+// not once per call. Ort::Session::Run is thread-safe, so the single session is
+// reused by all concurrent calls; per-call mutable state lives in each iterator.
+namespace {
+    std::mutex g_onnx_mutex;
+    std::shared_ptr<Ort::Env> g_onnx_env;
+    std::shared_ptr<Ort::Session> g_onnx_session;
+}
+
+// One-time initialization: load the shared ONNX Env + Session. Idempotent and
+// thread-safe, so it is safe to call from module load and again from each context
+// init — only the first call does the work.
 int VadIterator::global_init() {
+    std::lock_guard<std::mutex> lock(g_onnx_mutex);
+    if (g_onnx_session) {
+        return 0;  // already loaded
+    }
+
     // Get model path from environment or use default
     const char* model_path = getenv("SILERO_VAD_MODEL_PATH");
     if (!model_path) {
@@ -11,7 +29,7 @@ int VadIterator::global_init() {
     // Check if model file exists and is accessible
     FILE* test_file = fopen(model_path, "rb");
     if (!test_file) {
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, 
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
             "Silero VAD model file not found: %s\n"
             "Please download the model using: wget https://github.com/snakers4/silero-vad/raw/master/files/silero_vad.onnx -O %s\n"
             "Or set SILERO_VAD_MODEL_PATH environment variable to point to the model file.\n",
@@ -19,7 +37,45 @@ int VadIterator::global_init() {
         return -1;
     }
     fclose(test_file);
+
+    // Build the shared Env + Session once. Single-threaded op pools keep per-call
+    // CPU bounded; concurrency comes from running many calls on the shared session.
+    try {
+        g_onnx_env = std::make_shared<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "mod_vad_silero");
+        Ort::SessionOptions session_options;
+        session_options.SetIntraOpNumThreads(1);
+        session_options.SetInterOpNumThreads(1);
+        session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        g_onnx_session = std::make_shared<Ort::Session>(*g_onnx_env, model_path, session_options);
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+            "Silero VAD: loaded shared ONNX session from %s\n", model_path);
+    } catch (const std::exception& e) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+            "Silero VAD: failed to load ONNX model %s: %s\n", model_path, e.what());
+        g_onnx_session.reset();
+        g_onnx_env.reset();
+        return -1;
+    }
     return 0;
+}
+
+// Release the shared Session + Env (in that order: a Session must not outlive its
+// Env). Any VadIterator still holding shared_ptrs keeps both alive until it is
+// destroyed, so this is safe to call at module shutdown regardless of in-flight calls.
+void VadIterator::global_cleanup() {
+    std::lock_guard<std::mutex> lock(g_onnx_mutex);
+    g_onnx_session.reset();
+    g_onnx_env.reset();
+}
+
+std::shared_ptr<Ort::Env> VadIterator::get_shared_env() {
+    std::lock_guard<std::mutex> lock(g_onnx_mutex);
+    return g_onnx_env;
+}
+
+std::shared_ptr<Ort::Session> VadIterator::get_shared_session() {
+    std::lock_guard<std::mutex> lock(g_onnx_mutex);
+    return g_onnx_session;
 }
 
 VadIterator::VadIterator(const std::string ModelPath,

@@ -302,13 +302,17 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
                   // Add NULL check before strcasecmp to prevent segfault
                   if (state == SWITCH_VAD_STATE_STOP_TALKING && userData->strategy && !strcasecmp(userData->strategy, "one-shot")) {
                     userData->stopping = 1;
+                    // Record the state we just reported so the upcoming CLOSE does
+                    // not fire a duplicate stop event.
+                    userData->previous_vad_state = state;
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-                      "One-shot VAD detection completed, stopping detection\n");
-                    // Unlock before calling do_stop to avoid deadlock
+                      "One-shot VAD detection completed, requesting bug removal\n");
                     switch_mutex_unlock(userData->mutex);
-                    // Stop VAD detection directly - do_stop will handle cleanup
-                    do_stop(session, userData->bugname);
-                    return SWITCH_TRUE;
+                    // Returning SWITCH_FALSE from the bug callback asks the core to
+                    // close this bug safely (-> SWITCH_ABC_TYPE_CLOSE -> cleanup).
+                    // Removing the bug from inside its own callback (the old
+                    // do_stop path) is unsafe in FreeSWITCH and can deadlock/UAF.
+                    return SWITCH_FALSE;
                   }
                 break;
 
@@ -396,11 +400,26 @@ static switch_status_t start_capture(switch_core_session_t *session, switch_medi
       
     if ((status = switch_core_media_bug_add(session, bugname, NULL, capture_callback, userData, 0, flags, &bug)) != SWITCH_STATUS_SUCCESS) {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Failed to initiate vad resource\n");
+      // The bug never took ownership, so cleanup_vad_resources will not run for
+      // these allocations — free them here to avoid leaking on this error path.
+      silero_vad_destroy(userData->pVadContext);
+      userData->pVadContext = NULL;
+      switch_safe_free(userData->bugname);
+      switch_safe_free(userData->strategy);
+      switch_safe_free(userData->sessionId);
+      if (userData->resampler) {
+        speex_resampler_destroy(userData->resampler);
+        userData->resampler = NULL;
+      }
       return status;
     }
     switch_channel_set_private(channel, bugname, bug);
   } else {
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Failed to create Silero VAD context\n");
+    if (userData->resampler) {
+      speex_resampler_destroy(userData->resampler);
+      userData->resampler = NULL;
+    }
     return SWITCH_STATUS_FALSE;
   }
   return SWITCH_STATUS_SUCCESS;
@@ -439,9 +458,18 @@ SWITCH_STANDARD_API(vad_silero_function) {
         uint32_t min_speech_ms = atoi(argv[6]);
         char *bugname = argc > 7 ? argv[7] : MY_BUG_NAME;
 
+        // Validate threshold: it must be a probability in (0.0, 1.0]. Reject
+        // garbage / out-of-range input (atof returns 0.0 for non-numeric) and
+        // fall back to the Silero default of 0.5.
+        if (!(threshold > 0.0f && threshold <= 1.0f)) {
+          switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+            "Invalid VAD threshold '%s' (expected 0.0-1.0); using default 0.5\n", argv[3]);
+          threshold = 0.5f;
+        }
+
         // Use defaults if parameters are set to 0
         if (silence_ms == 0) silence_ms = 100;      // Default: 100ms
-        if (speech_pad_ms == 0) speech_pad_ms = 30;  // Default: 30ms  
+        if (speech_pad_ms == 0) speech_pad_ms = 30;  // Default: 30ms
         if (min_speech_ms == 0) min_speech_ms = 250; // Default: 250ms
 
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, 
@@ -501,5 +529,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_vad_silero_load)
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_vad_silero_shutdown)
 {
   switch_event_free_subclass(VAD_EVENT_SILERO);
+  /* Release the shared ONNX Env + Session loaded at module load. */
+  silero_vad_global_cleanup();
   return SWITCH_STATUS_SUCCESS;
 }

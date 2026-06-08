@@ -15,11 +15,13 @@ if [ -f "$MODEL_PATH" ]; then
     sudo rm "$MODEL_PATH"
 fi
 
-# Try different possible model file names and URLs based on the Python code
+# Pin to a release tag (overridable) so this matches the freeswitch-image build
+# and stays reproducible — avoid tracking the mutable `master` branch.
+SILERO_VAD_VERSION="${SILERO_VAD_VERSION:-v5.1.2}"
 MODEL_URLS=(
-    "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
-    "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad_16k_op15.onnx"
-    "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad_half.onnx"
+    "https://github.com/snakers4/silero-vad/raw/${SILERO_VAD_VERSION}/src/silero_vad/data/silero_vad.onnx"
+    "https://github.com/snakers4/silero-vad/raw/${SILERO_VAD_VERSION}/src/silero_vad/data/silero_vad_16k_op15.onnx"
+    "https://github.com/snakers4/silero-vad/raw/${SILERO_VAD_VERSION}/src/silero_vad/data/silero_vad_half.onnx"
 )
 
 for url in "${MODEL_URLS[@]}"; do

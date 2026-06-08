@@ -22,7 +22,6 @@
 // Vectorized int16_t to float conversion
 static void convert_int16_to_float(const int16_t* input, float* output, size_t samples) {
 #if defined(USE_AVX2)
-    #pragma message("Using AVX2 vectorized int16_t to float conversion")
     // AVX2 vectorized conversion
     const size_t vector_size = 8; // AVX2 processes 8 floats at a time
     const size_t vector_samples = samples & ~(vector_size - 1); // Round down to multiple of 8
@@ -53,7 +52,6 @@ static void convert_int16_to_float(const int16_t* input, float* output, size_t s
         output[i] = static_cast<float>(input[i]) / 32768.0f;
     }
 #elif defined(USE_SSE2)
-    #pragma message("Using SSE2 vectorized int16_t to float conversion")
     // SSE2 vectorized conversion
     const size_t vector_size = 4; // SSE2 processes 4 floats at a time
     const size_t vector_samples = samples & ~(vector_size - 1); // Round down to multiple of 4
@@ -84,7 +82,6 @@ static void convert_int16_to_float(const int16_t* input, float* output, size_t s
         output[i] = static_cast<float>(input[i]) / 32768.0f;
     }
 #else
-    #pragma message("Using scalar int16_t to float conversion (define USE_AVX2 or USE_SSE2 for vectorization)")
     // Scalar fallback
     for (size_t i = 0; i < samples; i++) {
         output[i] = static_cast<float>(input[i]) / 32768.0f;
@@ -201,7 +198,8 @@ public:
           if (audio_buffer.size() < window_size) {
             return 0;
           }
-          int16_t data[window_size];
+          // Fixed-size frame buffer (no VLA): 512 samples == 32ms @ 16kHz == window_size.
+          int16_t data[WINDOW_SIZE_16K];
           auto count = audio_buffer.getBlock(&data[0], window_size);
           if (count != window_size) {
             return -1;
@@ -243,27 +241,6 @@ public:
               "%s Error during Silero VAD processing: %s\n", session_id.c_str(), e.what());
           return -1;
       }
-    }
-
-    int set_param(const char* param_name, float value) {
-        std::lock_guard<std::mutex> lock(context_mutex);
-
-        if (!is_initialized) {
-            return -1;
-        }
-
-        if (strcmp(param_name, "threshold") == 0) {
-            threshold = value;
-            // Note: VadIterator doesn't support runtime threshold changes
-            // We would need to recreate it, but that's complex
-            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-                "Silero VAD threshold changes require reinitialization (not supported)\n");
-            return -1;
-        } else {
-            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-                "Unknown Silero VAD parameter: %s\n", param_name);
-            return -1;
-        }
     }
 
     void cleanup() {
@@ -312,7 +289,8 @@ int silero_vad_global_init(void) {
 }
 
 void silero_vad_global_cleanup(void) {
-    // Currently no cleanup needed, but keeping the interface for future use
+    // Release the shared ONNX Env + Session loaded in global_init.
+    VadIterator::global_cleanup();
 }
 
 void* silero_vad_create(const char* session_id, int sample_rate, float threshold, int min_silence_duration_ms,
@@ -342,12 +320,6 @@ void silero_vad_destroy(void* ctx) {
         // Delete the shared_ptr wrapper allocated in silero_vad_create
         delete reinterpret_cast<std::shared_ptr<SileroVADContext>*>(ctx);
     }
-}
-
-int silero_vad_set_param(void* ctx, const char* param_name, float value) {
-    auto vadCtx = getVadContext(ctx);
-    if (!vadCtx) return -1;
-    return vadCtx->set_param(param_name, value);
 }
 
 float silero_vad_get_probability(void* ctx) {

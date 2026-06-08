@@ -46,15 +46,6 @@ void* silero_vad_create(const char* sessionId, int sample_rate, float threshold,
 int silero_vad_process(void* ctx, SpeexResamplerState *resampler, const int16_t* audio_data, int samples, int* vad_state);
 
 /**
- * Set a parameter for the VAD context
- * @param ctx VAD context pointer
- * @param param_name Parameter name ("threshold")
- * @param value Parameter value
- * @return 0 on success, -1 on error
- */
-int silero_vad_set_param(void* ctx, const char* param_name, float value);
-
-/**
  * Get the current speech probability from the VAD context
  * @param ctx VAD context pointer
  * @return Current speech probability (0.0 to 1.0), or -1.0 on error

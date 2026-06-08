@@ -25,9 +25,15 @@
 // VadIterator class: uses ONNX Runtime to detect speech segments.
 class VadIterator {
 private:
-    // ONNX Runtime resources
-    Ort::Env env;
-    Ort::SessionOptions session_options;
+    // ONNX Runtime resources. The Env and the model Session are process-global and
+    // shared across every VadIterator instance (loaded once in global_init), so the
+    // model is read from disk and the inference graph built exactly once instead of
+    // once per call. Ort::Session::Run is thread-safe, and each call's mutable state
+    // lives in the per-instance _state / _context tensors below, so concurrent calls
+    // on the shared session are safe. Both are held by shared_ptr so an in-flight
+    // call keeps them alive even if global_cleanup() runs at module shutdown
+    // (env is declared first so it outlives session on destruction).
+    std::shared_ptr<Ort::Env> env;
     std::shared_ptr<Ort::Session> session = nullptr;
     Ort::AllocatorWithDefaultOptions allocator;
     Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeCPU);
@@ -78,21 +84,17 @@ private:
     bool speech_started_this_frame = false;
     bool speech_ended_this_frame = false;
 
-    // Creates a new ONNX session instance for this VadIterator
+    // Attach this iterator to the process-global ONNX Env + Session (loaded once in
+    // global_init). Throws if the shared session is unavailable so the caller
+    // (SileroVADContext::initialize) can fail cleanly. The model path is fixed at
+    // global_init time; the argument is kept only for signature compatibility.
     void init_onnx_model(const std::string& model_path) {
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, 
-            "Creating new ONNX session for model: %s\n", model_path.c_str());
-        init_engine_threads(1, 1);
-        session = std::make_shared<Ort::Session>(env, model_path.c_str(), session_options);
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, 
-            "ONNX session created successfully\n");
-    }
-
-    // Initializes threading settings.
-    void init_engine_threads(int inter_threads, int intra_threads) {
-        session_options.SetIntraOpNumThreads(intra_threads);
-        session_options.SetInterOpNumThreads(inter_threads);
-        session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        env = get_shared_env();
+        session = get_shared_session();
+        if (!env || !session) {
+            throw std::runtime_error("Silero VAD ONNX session not initialized; call global_init() first");
+        }
+        (void) model_path;
     }
 
     // Resets internal state (_state, _context, etc.)
@@ -134,8 +136,14 @@ public:
         reset_states();
     }
 
-    // Static method for one-time initialization
+    // Process-wide model lifecycle. global_init() loads the shared Ort::Env +
+    // Session once (idempotent, thread-safe); global_cleanup() releases them at
+    // module shutdown. The get_shared_* accessors return the loaded resources
+    // (or null if global_init has not run / failed).
     static int global_init();
+    static void global_cleanup();
+    static std::shared_ptr<Ort::Env> get_shared_env();
+    static std::shared_ptr<Ort::Session> get_shared_session();
 
 public:
     // Constructor: sets model path, sample rate, window size (ms), and other parameters.
