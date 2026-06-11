@@ -120,8 +120,8 @@ namespace {
 
     //switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Prebuffered data samples %u is above threshold %u, prepare to playout.\n", cBuffer->size(), tech_pvt->streamingPreBufSize);
 
-    // after initial pre-buffering, rachet down the threshold to 40ms
-    tech_pvt->streamingPreBufSize = 320 * tech_pvt->downscale_factor * 2;
+    // after initial pre-buffering, rachet down the threshold to 20ms
+    tech_pvt->streamingPreBufSize = 320 * tech_pvt->downscale_factor;
 
     // Check for downsampling factor
     size_t downsample_factor = tech_pvt->downscale_factor;
@@ -530,7 +530,7 @@ namespace {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "downscale_factor is %d\n", tech_pvt->downscale_factor);
       }
     }
-    tech_pvt->streamingPreBufSize = 320 * tech_pvt->downscale_factor * 4; // min 80ms prebuffer
+    tech_pvt->streamingPreBufSize = 320 * tech_pvt->downscale_factor * 2; // min 40ms prebuffer
     tech_pvt->streamingPreBuffer = (void *) new CircularBuffer_t(8192);
     tech_pvt->pVecMarksInInventory = nullptr;
     tech_pvt->pVecMarksInUse = nullptr;
