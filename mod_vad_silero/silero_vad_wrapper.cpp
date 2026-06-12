@@ -64,8 +64,9 @@ static void convert_int16_to_float(const int16_t* input, float* output, size_t s
         // Load 4 int16_t values (64 bits)
         __m128i int16_vec = _mm_loadl_epi64((__m128i*)(input + i));
         
-        // Convert to 32-bit integers (sign extend)
-        __m128i int32_vec = _mm_cvtepi16_epi32(int16_vec);
+        // Convert to 32-bit integers (sign extend; _mm_cvtepi16_epi32 is SSE4.1)
+        __m128i sign_vec = _mm_srai_epi16(int16_vec, 15);
+        __m128i int32_vec = _mm_unpacklo_epi16(int16_vec, sign_vec);
         
         // Convert to float
         __m128 float_vec = _mm_cvtepi32_ps(int32_vec);
