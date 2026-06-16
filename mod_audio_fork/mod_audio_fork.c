@@ -220,6 +220,7 @@ SWITCH_STANDARD_API(fork_function)
 				status = do_stop(lsession, bugname, text);
       }
 			else if (!strcasecmp(argv[1], "stop_play")) {
+        if (argc > 2) bugname = argv[2];
 				status = stop_play(lsession, bugname);
 			}
 			else if (!strcasecmp(argv[1], "pause")) {
