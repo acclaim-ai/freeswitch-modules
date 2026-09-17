@@ -939,20 +939,30 @@ extern "C" {
     if (pAudioPipe) pAudioPipe->close();
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%u) fork_session_cleanup: connection closed\n", id);
 
-    // delete any temp files and destroy tech_pvt off the calling thread - fire and forget,
-    // tech_pvt is already unlinked from the channel/bug so nothing else can reach it
+    // Capture the playout list here, synchronously, while tech_pvt is still guaranteed
+    // valid - tech_pvt lives in the session's memory pool, which may be destroyed as
+    // soon as this function returns. The struct playout nodes themselves are plain
+    // malloc()'d (see fork_data_init), independent of that pool, so once we've copied
+    // this pointer out, the detached thread below can walk/free them without ever
+    // touching tech_pvt again.
+    struct playout* playout = tech_pvt->playout;
+
+    // destroy_tech_pvt() is pure in-memory heap frees (speex/opus/circular buffers,
+    // the pool-backed mutex) - fast, so it stays on the calling thread. Only the
+    // std::remove() calls below do real (slow) filesystem I/O, so only those are
+    // deferred off the calling thread (which is holding session->bug_rwlock here).
+    destroy_tech_pvt(tech_pvt);
+
     g_fork_cleanup_threads.fetch_add(1, std::memory_order_relaxed);
-    std::thread([tech_pvt]() {
-      struct playout* playout = tech_pvt->playout;
-      while (playout) {
-        std::remove(playout->file);
-        free(playout->file);
-        struct playout *tmp = playout;
-        playout = playout->next;
+    std::thread([playout]() {
+      struct playout* p = playout;
+      while (p) {
+        std::remove(p->file);
+        free(p->file);
+        struct playout *tmp = p;
+        p = p->next;
         free(tmp);
       }
-
-      destroy_tech_pvt(tech_pvt);
       g_fork_cleanup_threads.fetch_sub(1, std::memory_order_relaxed);
     }).detach();
 
