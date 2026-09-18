@@ -4,6 +4,8 @@
 #include <string>
 #include <mutex>
 #include <thread>
+#include <atomic>
+#include <chrono>
 #include <list>
 #include <algorithm>
 #include <functional>
@@ -25,6 +27,10 @@
 
 
 typedef boost::circular_buffer<uint16_t> CircularBuffer_t;
+
+// count of detached fork_session_cleanup background threads still running,
+// so fork_cleanup() can wait for them to finish before the module unloads
+static std::atomic<int> g_fork_cleanup_threads{0};
 
 #define RTP_PACKETIZATION_PERIOD 20
 #define FRAME_SIZE_8000  320 /*which means each 20ms frame as 320 bytes at 8 khz (1 channel only)*/
@@ -833,6 +839,20 @@ extern "C" {
     bool cleanup = false;
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork unloading..\n");
 
+    // wait (briefly) for any detached fork_session_cleanup threads to finish - they run
+    // code from this module and must not still be executing once we unload it
+    const int max_wait_ms = 5000;
+    int waited_ms = 0;
+    while (g_fork_cleanup_threads.load(std::memory_order_relaxed) > 0 && waited_ms < max_wait_ms) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      waited_ms += 50;
+    }
+    if (g_fork_cleanup_threads.load(std::memory_order_relaxed) > 0) {
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+        "mod_audio_fork unloading with %d cleanup thread(s) still running after %dms\n",
+        g_fork_cleanup_threads.load(std::memory_order_relaxed), max_wait_ms);
+    }
+
     cleanup = drachtio::AudioPipe::deinitialize();
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork unloaded status %d\n", cleanup);
     if (cleanup == true) {
@@ -913,21 +933,39 @@ extern "C" {
       }
     }
 
-    // delete any temp files
-    struct playout* playout = tech_pvt->playout;
-    while (playout) {
-      std::remove(playout->file);
-      free(playout->file);
-      struct playout *tmp = playout;
-      playout = playout->next;
-      free(tmp);
-    }
+    switch_mutex_unlock(tech_pvt->mutex);
 
     if (pAudioPipe && text) pAudioPipe->bufferForSending(text);
     if (pAudioPipe) pAudioPipe->close();
-
-    destroy_tech_pvt(tech_pvt);
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%u) fork_session_cleanup: connection closed\n", id);
+
+    // Capture the playout list here, synchronously, while tech_pvt is still guaranteed
+    // valid - tech_pvt lives in the session's memory pool, which may be destroyed as
+    // soon as this function returns. The struct playout nodes themselves are plain
+    // malloc()'d (see fork_data_init), independent of that pool, so once we've copied
+    // this pointer out, the detached thread below can walk/free them without ever
+    // touching tech_pvt again.
+    struct playout* playout = tech_pvt->playout;
+
+    // destroy_tech_pvt() is pure in-memory heap frees (speex/opus/circular buffers,
+    // the pool-backed mutex) - fast, so it stays on the calling thread. Only the
+    // std::remove() calls below do real (slow) filesystem I/O, so only those are
+    // deferred off the calling thread (which is holding session->bug_rwlock here).
+    destroy_tech_pvt(tech_pvt);
+
+    g_fork_cleanup_threads.fetch_add(1, std::memory_order_relaxed);
+    std::thread([playout]() {
+      struct playout* p = playout;
+      while (p) {
+        std::remove(p->file);
+        free(p->file);
+        struct playout *tmp = p;
+        p = p->next;
+        free(tmp);
+      }
+      g_fork_cleanup_threads.fetch_sub(1, std::memory_order_relaxed);
+    }).detach();
+
     return SWITCH_STATUS_SUCCESS;
   }
 
