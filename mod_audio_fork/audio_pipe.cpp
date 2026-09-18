@@ -1,6 +1,7 @@
 #include "audio_pipe.hpp"
 #include <switch.h>
 
+#include <atomic>
 #include <cassert>
 #include <iostream>
 
@@ -16,6 +17,11 @@ namespace {
 
   static const char *requestedTcpKeepaliveSecs = std::getenv("MOD_AUDIO_FORK_TCP_KEEPALIVE_SECS");
   static int nTcpKeepaliveSecs = requestedTcpKeepaliveSecs ? ::atoi(requestedTcpKeepaliveSecs) : 55;
+
+  // temporary leak-hunting instrumentation: how many AudioPipe objects are currently
+  // alive. Logged on every create/destroy so a load test's log can be grepped for
+  // "AudioPipe live=" to see whether destructions actually keep pace with creations.
+  static std::atomic<long> g_audiopipe_live{0};
 }
 
 // remove once we update to lws with this helper
@@ -507,8 +513,12 @@ AudioPipe::AudioPipe(const char* uuid, const char* host, unsigned int port, cons
   }
   m_bidirectional_audio_stream = bidirectional_audio_stream;
   m_audio_buffer = new uint8_t[m_audio_buffer_max_len];
+  switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "AudioPipe %s CREATED live=%ld\n",
+    m_uuid.c_str(), ++g_audiopipe_live);
 }
 AudioPipe::~AudioPipe() {
+  switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "AudioPipe %s DESTROYED live=%ld\n",
+    m_uuid.c_str(), --g_audiopipe_live);
   if (m_audio_buffer) delete [] m_audio_buffer;
   if (m_recv_buf) free(m_recv_buf);
 }
