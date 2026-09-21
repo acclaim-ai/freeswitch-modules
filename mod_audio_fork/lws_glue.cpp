@@ -933,7 +933,7 @@ extern "C" {
 
     if (!tech_pvt) return SWITCH_STATUS_FALSE;
     drachtio::AudioPipe *pAudioPipe = static_cast<drachtio::AudioPipe *>(tech_pvt->pAudioPipe);
-    struct playout* playout;
+    struct playout* = NULL;
 
     switch_mutex_lock(tech_pvt->mutex);
 
