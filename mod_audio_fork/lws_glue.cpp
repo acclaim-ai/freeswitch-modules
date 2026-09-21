@@ -311,12 +311,16 @@ namespace {
             f << rawAudio;
             f.close();
 
-            // add the file to the list of files played for this session, we'll delete when session closes
+            // add the file to the list of files played for this session, we'll delete when session
+            // closes - locked against fork_session_cleanup's capture of tech_pvt->playout, which
+            // otherwise races this append (lws_glue.cpp: fork_session_cleanup)
             struct playout* playout = (struct playout *) malloc(sizeof(struct playout));
             playout->file = (char *) malloc(strlen(szFilePath) + 1);
             strcpy(playout->file, szFilePath);
+            switch_mutex_lock(tech_pvt->mutex);
             playout->next = tech_pvt->playout;
             tech_pvt->playout = playout;
+            switch_mutex_unlock(tech_pvt->mutex);
 
             jsonFile = cJSON_CreateString(szFilePath);
             cJSON_AddItemToObject(jsonData, "file", jsonFile);
@@ -682,10 +686,13 @@ namespace {
       speex_resampler_destroy(tech_pvt->bidirectional_audio_resampler);
       tech_pvt->bidirectional_audio_resampler = nullptr;
     }
-    if (tech_pvt->mutex) {
-      switch_mutex_destroy(tech_pvt->mutex);
-      tech_pvt->mutex = nullptr;
-    }
+    // tech_pvt->mutex is pool-owned (switch_mutex_init(..., session_pool)) - APR
+    // destroys it automatically, safely, when the session pool itself is destroyed
+    // (properly serialized behind session->rwlock). Destroying it manually here would
+    // race any in-flight processIncomingMessage call that's about to lock it (it's
+    // protected against the session disappearing via switch_core_session_locate, but
+    // not against fork_session_cleanup running concurrently on the session's own
+    // thread), so it's left for the pool to clean up instead of destroyed here.
     if (tech_pvt->streamingPlayoutBuffer) {
       CircularBuffer_t *cBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
       delete cBuffer;
@@ -919,7 +926,8 @@ extern "C" {
 
     if (!tech_pvt) return SWITCH_STATUS_FALSE;
     drachtio::AudioPipe *pAudioPipe = static_cast<drachtio::AudioPipe *>(tech_pvt->pAudioPipe);
-      
+    struct playout* playout;
+
     switch_mutex_lock(tech_pvt->mutex);
 
     // get the bug again, now that we are under lock
@@ -933,24 +941,26 @@ extern "C" {
       }
     }
 
+    // Capture the playout list under the same lock that unlinks the bug from the
+    // channel, and under the same mutex processIncomingMessage takes before appending
+    // a new node. Once the bug is unlinked above, no future incoming message can reach
+    // that append code at all (its own bug lookup will come back null), and any append
+    // still in flight when we get here is safely captured below instead of racing us
+    // and being silently orphaned (leaking the node and its temp audio file on disk).
+    playout = tech_pvt->playout;
+    tech_pvt->playout = NULL;
+
     switch_mutex_unlock(tech_pvt->mutex);
 
     if (pAudioPipe && text) pAudioPipe->bufferForSending(text);
     if (pAudioPipe) pAudioPipe->close();
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%u) fork_session_cleanup: connection closed\n", id);
 
-    // Capture the playout list here, synchronously, while tech_pvt is still guaranteed
-    // valid - tech_pvt lives in the session's memory pool, which may be destroyed as
-    // soon as this function returns. The struct playout nodes themselves are plain
-    // malloc()'d (see fork_data_init), independent of that pool, so once we've copied
-    // this pointer out, the detached thread below can walk/free them without ever
-    // touching tech_pvt again.
-    struct playout* playout = tech_pvt->playout;
-
-    // destroy_tech_pvt() is pure in-memory heap frees (speex/opus/circular buffers,
-    // the pool-backed mutex) - fast, so it stays on the calling thread. Only the
-    // std::remove() calls below do real (slow) filesystem I/O, so only those are
-    // deferred off the calling thread (which is holding session->bug_rwlock here).
+    // destroy_tech_pvt() is pure in-memory heap frees (speex/opus/circular buffers) -
+    // fast, so it stays on the calling thread. Only the std::remove() calls below do
+    // real (slow) filesystem I/O, so only those are deferred off the calling thread
+    // (which is holding session->bug_rwlock here). `playout` was already captured
+    // above, under tech_pvt->mutex.
     destroy_tech_pvt(tech_pvt);
 
     g_fork_cleanup_threads.fetch_add(1, std::memory_order_relaxed);
