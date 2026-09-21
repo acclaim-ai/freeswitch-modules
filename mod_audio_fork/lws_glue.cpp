@@ -179,6 +179,13 @@ namespace {
 
     if (nullptr != tech_pvt->mutex && switch_mutex_trylock(tech_pvt->mutex) == SWITCH_STATUS_SUCCESS) {
       CircularBuffer_t *playoutBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
+      if (!playoutBuffer) {
+        // session is mid/post teardown (destroy_tech_pvt already freed and nulled this
+        // under the same lock) - nothing to do
+        switch_mutex_unlock(tech_pvt->mutex);
+        cBuffer->clear();
+        return SWITCH_STATUS_SUCCESS;
+      }
 
       try {
         // Resize the buffer if necessary
@@ -961,7 +968,17 @@ extern "C" {
     // real (slow) filesystem I/O, so only those are deferred off the calling thread
     // (which is holding session->bug_rwlock here). `playout` was already captured
     // above, under tech_pvt->mutex.
+    //
+    // Re-take the mutex around the frees themselves: processIncomingBinary/
+    // dub_speech_frame/etc. all trylock this same mutex before touching
+    // streamingPlayoutBuffer/streamingPreBuffer, on the assumption that holding the
+    // lock keeps those buffers alive. Since the mutex is intentionally never destroyed
+    // (see destroy_tech_pvt), trylock always succeeds even after teardown - without
+    // this lock, destroy_tech_pvt's delete of those buffers races any such reader,
+    // giving either a use-after-free or (once nulled) a null deref.
+    switch_mutex_lock(tech_pvt->mutex);
     destroy_tech_pvt(tech_pvt);
+    switch_mutex_unlock(tech_pvt->mutex);
 
     g_fork_cleanup_threads.fetch_add(1, std::memory_order_relaxed);
     std::thread([playout]() {
@@ -1199,8 +1216,14 @@ extern "C" {
   }
 
   switch_bool_t dub_speech_frame(switch_media_bug_t *bug, private_t* tech_pvt) {
-    CircularBuffer_t *cBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
     if (switch_mutex_trylock(tech_pvt->mutex) == SWITCH_STATUS_SUCCESS) {
+      // Read this under the lock, not before it - destroy_tech_pvt() frees and nulls
+      // it under this same mutex, so a pre-lock read here could be racing that free.
+      CircularBuffer_t *cBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
+      if (!cBuffer) {
+        switch_mutex_unlock(tech_pvt->mutex);
+        return SWITCH_TRUE;
+      }
 
       // if flag was set to clear the buffer, do so and clear the flag
       if (tech_pvt->clear_bidirectional_audio_buffer) {
@@ -1355,9 +1378,9 @@ extern "C" {
     }
     private_t* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
 
-    CircularBuffer_t *cBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
-
     if (switch_mutex_trylock(tech_pvt->mutex) == SWITCH_STATUS_SUCCESS) {
+      // Read under the lock - see dub_speech_frame for why a pre-lock read is unsafe.
+      CircularBuffer_t *cBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
       if (cBuffer != nullptr) {
         cBuffer->clear();
       }
