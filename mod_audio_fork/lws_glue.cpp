@@ -18,6 +18,16 @@
 #include "base64.hpp"
 #include "parser.hpp"
 #include "mod_audio_fork.h"
+// Wrapped in extern "C": this file's own fork_*/dub_speech_frame definitions live inside
+// an `extern "C" { }` block further down (for mod_audio_fork.c, a plain C file, to call
+// them), so these declarations need matching C linkage here too - including the header
+// unwrapped would give them default C++ linkage instead, conflicting with those later
+// definitions. Doing it this way also means the compiler checks every definition below
+// against its prototype here, instead of us maintaining hand-written forward
+// declarations in sync by hand.
+extern "C" {
+#include "lws_glue.h"
+}
 #include "audio_pipe.hpp"
 #include "vector_math.h"
 
@@ -881,7 +891,7 @@ extern "C" {
     return SWITCH_STATUS_FALSE;
   }
 
-  switch_status_t fork_session_init(switch_core_session_t *session, 
+  switch_status_t fork_session_init(switch_core_session_t *session,
     responseHandler_t responseHandler,
     uint32_t samples_per_second, 
     char *host,
@@ -910,19 +920,8 @@ extern "C" {
 
     if (SWITCH_STATUS_SUCCESS != fork_data_init(tech_pvt, session, host, port, path, sslFlags, samples_per_second, sampling, channels,
       bugname, metadata, bidirectional_audio_enable, bidirectional_audio_stream, bidirectional_audio_sample_rate, ws_codec, responseHandler)) {
-      // fork_data_init() may have already created the AudioPipe (stored in
-      // tech_pvt->pAudioPipe) before failing at a later step (resampler/OPUS encoder or
-      // decoder init). destroy_tech_pvt() never touches pAudioPipe - that's normally
-      // correct, since the live AudioPipe is owned by fork_session_cleanup/lws's own
-      // async close handling once connect() has run - but connect() is never reached on
-      // this failure path, so lws never learns this pipe exists and will never close or
-      // delete it. Safe to delete it directly here: nothing else can be concurrently
-      // using an AudioPipe that was never connected.
-      if (tech_pvt->pAudioPipe) {
-        delete static_cast<drachtio::AudioPipe*>(tech_pvt->pAudioPipe);
-        tech_pvt->pAudioPipe = nullptr;
-      }
-      destroy_tech_pvt(tech_pvt);
+      void *pUserData = static_cast<void*>(tech_pvt);
+      fork_session_destroy(&pUserData);
       return SWITCH_STATUS_FALSE;
     }
 
@@ -935,6 +934,26 @@ extern "C" {
     drachtio::AudioPipe *pAudioPipe = static_cast<drachtio::AudioPipe*>(tech_pvt->pAudioPipe);
     pAudioPipe->connect();
     return SWITCH_STATUS_SUCCESS;
+  }
+
+  // Tears down a tech_pvt that was successfully created (by fork_session_init()) but
+  // never got as far as being attached to the channel as a media bug - e.g.
+  // fork_data_init() itself failed partway through (resampler/OPUS init), or the caller's
+  // subsequent switch_core_media_bug_add() failed. In both cases connect() was never
+  // reached, so lws never learned this AudioPipe exists and will never close/delete it -
+  // safe to delete it directly here, since nothing else can be concurrently using an
+  // AudioPipe that was never connected. destroy_tech_pvt() itself never touches
+  // pAudioPipe, since in the *normal* teardown path (fork_session_cleanup) the AudioPipe
+  // is owned by lws's own async close handling instead.
+  void fork_session_destroy(void **ppUserData) {
+    if (!ppUserData || !*ppUserData) return;
+    private_t* tech_pvt = static_cast<private_t*>(*ppUserData);
+    if (tech_pvt->pAudioPipe) {
+      delete static_cast<drachtio::AudioPipe*>(tech_pvt->pAudioPipe);
+      tech_pvt->pAudioPipe = nullptr;
+    }
+    destroy_tech_pvt(tech_pvt);
+    *ppUserData = nullptr;
   }
 
   switch_status_t fork_session_cleanup(switch_core_session_t *session, char *bugname, char* text, int channelIsClosing) {
