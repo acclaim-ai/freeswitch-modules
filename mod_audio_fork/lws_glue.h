@@ -20,4 +20,12 @@ switch_bool_t fork_frame(switch_core_session_t *session, switch_media_bug_t *bug
 switch_bool_t dub_speech_frame(switch_media_bug_t *bug, private_t * tech_pvt);
 switch_status_t fork_service_threads();
 switch_status_t fork_session_connect(void **ppUserData);
+
+// Tears down a tech_pvt that was successfully created by fork_session_init() but never
+// got as far as being attached to the channel as a media bug (e.g. switch_core_media_bug_add()
+// itself failed after fork_session_init() already succeeded). Unlike fork_session_cleanup(),
+// this does not require a bug to be registered on the channel - it operates directly on
+// *ppUserData. Safe to call any time after fork_session_init() returns success and before
+// switch_core_media_bug_add() succeeds; nulls *ppUserData when done.
+void fork_session_destroy(void **ppUserData);
 #endif

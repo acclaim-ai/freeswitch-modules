@@ -4,6 +4,8 @@
 #include <string>
 #include <mutex>
 #include <thread>
+#include <atomic>
+#include <chrono>
 #include <list>
 #include <algorithm>
 #include <functional>
@@ -16,6 +18,16 @@
 #include "base64.hpp"
 #include "parser.hpp"
 #include "mod_audio_fork.h"
+// Wrapped in extern "C": this file's own fork_*/dub_speech_frame definitions live inside
+// an `extern "C" { }` block further down (for mod_audio_fork.c, a plain C file, to call
+// them), so these declarations need matching C linkage here too - including the header
+// unwrapped would give them default C++ linkage instead, conflicting with those later
+// definitions. Doing it this way also means the compiler checks every definition below
+// against its prototype here, instead of us maintaining hand-written forward
+// declarations in sync by hand.
+extern "C" {
+#include "lws_glue.h"
+}
 #include "audio_pipe.hpp"
 #include "vector_math.h"
 
@@ -25,6 +37,10 @@
 
 
 typedef boost::circular_buffer<uint16_t> CircularBuffer_t;
+
+// count of detached fork_session_cleanup background threads still running,
+// so fork_cleanup() can wait for them to finish before the module unloads
+static std::atomic<int> g_fork_cleanup_threads{0};
 
 #define RTP_PACKETIZATION_PERIOD 20
 #define FRAME_SIZE_8000  320 /*which means each 20ms frame as 320 bytes at 8 khz (1 channel only)*/
@@ -173,6 +189,13 @@ namespace {
 
     if (nullptr != tech_pvt->mutex && switch_mutex_trylock(tech_pvt->mutex) == SWITCH_STATUS_SUCCESS) {
       CircularBuffer_t *playoutBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
+      if (!playoutBuffer) {
+        // session is mid/post teardown (destroy_tech_pvt already freed and nulled this
+        // under the same lock) - nothing to do
+        switch_mutex_unlock(tech_pvt->mutex);
+        cBuffer->clear();
+        return SWITCH_STATUS_SUCCESS;
+      }
 
       try {
         // Resize the buffer if necessary
@@ -305,12 +328,20 @@ namespace {
             f << rawAudio;
             f.close();
 
-            // add the file to the list of files played for this session, we'll delete when session closes
+            // add the file to the list of files played for this session, we'll delete when session
+            // closes - locked against fork_session_cleanup's capture of tech_pvt->playout, which
+            // otherwise races this append (lws_glue.cpp: fork_session_cleanup). Uses the dedicated
+            // playout_mutex, not the general tech_pvt->mutex: this runs on the module's single
+            // shared lws service thread, and tech_pvt->mutex is held across real per-frame work
+            // elsewhere (resampling, OPUS encode) - blocking here on that mutex would stall
+            // WebSocket I/O for every other concurrent call, not just this one.
             struct playout* playout = (struct playout *) malloc(sizeof(struct playout));
             playout->file = (char *) malloc(strlen(szFilePath) + 1);
             strcpy(playout->file, szFilePath);
+            switch_mutex_lock(tech_pvt->playout_mutex);
             playout->next = tech_pvt->playout;
             tech_pvt->playout = playout;
+            switch_mutex_unlock(tech_pvt->playout_mutex);
 
             jsonFile = cJSON_CreateString(szFilePath);
             cJSON_AddItemToObject(jsonData, "file", jsonFile);
@@ -557,6 +588,7 @@ namespace {
     tech_pvt->pAudioPipe = static_cast<void *>(ap);
 
     switch_mutex_init(&tech_pvt->mutex, SWITCH_MUTEX_NESTED, switch_core_session_get_pool(session));
+    switch_mutex_init(&tech_pvt->playout_mutex, SWITCH_MUTEX_NESTED, switch_core_session_get_pool(session));
 
     /* For OPUS encoding, force resampler target to 48kHz */
     int resamplerTarget = desiredSampling;
@@ -676,10 +708,14 @@ namespace {
       speex_resampler_destroy(tech_pvt->bidirectional_audio_resampler);
       tech_pvt->bidirectional_audio_resampler = nullptr;
     }
-    if (tech_pvt->mutex) {
-      switch_mutex_destroy(tech_pvt->mutex);
-      tech_pvt->mutex = nullptr;
-    }
+    // tech_pvt->mutex and tech_pvt->playout_mutex are pool-owned (switch_mutex_init(...,
+    // session_pool)) - APR destroys them automatically, safely, when the session pool
+    // itself is destroyed (properly serialized behind session->rwlock). Destroying
+    // either manually here would race any in-flight processIncomingMessage call that's
+    // about to lock it (it's protected against the session disappearing via
+    // switch_core_session_locate, but not against fork_session_cleanup running
+    // concurrently on the session's own thread), so they're left for the pool to clean
+    // up instead of destroyed here.
     if (tech_pvt->streamingPlayoutBuffer) {
       CircularBuffer_t *cBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
       delete cBuffer;
@@ -833,6 +869,20 @@ extern "C" {
     bool cleanup = false;
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork unloading..\n");
 
+    // wait (briefly) for any detached fork_session_cleanup threads to finish - they run
+    // code from this module and must not still be executing once we unload it
+    const int max_wait_ms = 5000;
+    int waited_ms = 0;
+    while (g_fork_cleanup_threads.load(std::memory_order_relaxed) > 0 && waited_ms < max_wait_ms) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      waited_ms += 50;
+    }
+    if (g_fork_cleanup_threads.load(std::memory_order_relaxed) > 0) {
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+        "mod_audio_fork unloading with %d cleanup thread(s) still running after %dms\n",
+        g_fork_cleanup_threads.load(std::memory_order_relaxed), max_wait_ms);
+    }
+
     cleanup = drachtio::AudioPipe::deinitialize();
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork unloaded status %d\n", cleanup);
     if (cleanup == true) {
@@ -841,7 +891,7 @@ extern "C" {
     return SWITCH_STATUS_FALSE;
   }
 
-  switch_status_t fork_session_init(switch_core_session_t *session, 
+  switch_status_t fork_session_init(switch_core_session_t *session,
     responseHandler_t responseHandler,
     uint32_t samples_per_second, 
     char *host,
@@ -868,9 +918,10 @@ extern "C" {
       return SWITCH_STATUS_FALSE;
     }
 
-    if (SWITCH_STATUS_SUCCESS != fork_data_init(tech_pvt, session, host, port, path, sslFlags, samples_per_second, sampling, channels, 
+    if (SWITCH_STATUS_SUCCESS != fork_data_init(tech_pvt, session, host, port, path, sslFlags, samples_per_second, sampling, channels,
       bugname, metadata, bidirectional_audio_enable, bidirectional_audio_stream, bidirectional_audio_sample_rate, ws_codec, responseHandler)) {
-      destroy_tech_pvt(tech_pvt);
+      void *pUserData = static_cast<void*>(tech_pvt);
+      fork_session_destroy(&pUserData);
       return SWITCH_STATUS_FALSE;
     }
 
@@ -883,6 +934,26 @@ extern "C" {
     drachtio::AudioPipe *pAudioPipe = static_cast<drachtio::AudioPipe*>(tech_pvt->pAudioPipe);
     pAudioPipe->connect();
     return SWITCH_STATUS_SUCCESS;
+  }
+
+  // Tears down a tech_pvt that was successfully created (by fork_session_init()) but
+  // never got as far as being attached to the channel as a media bug - e.g.
+  // fork_data_init() itself failed partway through (resampler/OPUS init), or the caller's
+  // subsequent switch_core_media_bug_add() failed. In both cases connect() was never
+  // reached, so lws never learned this AudioPipe exists and will never close/delete it -
+  // safe to delete it directly here, since nothing else can be concurrently using an
+  // AudioPipe that was never connected. destroy_tech_pvt() itself never touches
+  // pAudioPipe, since in the *normal* teardown path (fork_session_cleanup) the AudioPipe
+  // is owned by lws's own async close handling instead.
+  void fork_session_destroy(void **ppUserData) {
+    if (!ppUserData || !*ppUserData) return;
+    private_t* tech_pvt = static_cast<private_t*>(*ppUserData);
+    if (tech_pvt->pAudioPipe) {
+      delete static_cast<drachtio::AudioPipe*>(tech_pvt->pAudioPipe);
+      tech_pvt->pAudioPipe = nullptr;
+    }
+    destroy_tech_pvt(tech_pvt);
+    *ppUserData = nullptr;
   }
 
   switch_status_t fork_session_cleanup(switch_core_session_t *session, char *bugname, char* text, int channelIsClosing) {
@@ -899,7 +970,8 @@ extern "C" {
 
     if (!tech_pvt) return SWITCH_STATUS_FALSE;
     drachtio::AudioPipe *pAudioPipe = static_cast<drachtio::AudioPipe *>(tech_pvt->pAudioPipe);
-      
+    struct playout* playout = NULL;
+
     switch_mutex_lock(tech_pvt->mutex);
 
     // get the bug again, now that we are under lock
@@ -913,21 +985,56 @@ extern "C" {
       }
     }
 
-    // delete any temp files
-    struct playout* playout = tech_pvt->playout;
-    while (playout) {
-      std::remove(playout->file);
-      free(playout->file);
-      struct playout *tmp = playout;
-      playout = playout->next;
-      free(tmp);
-    }
+    switch_mutex_unlock(tech_pvt->mutex);
+
+    // Capture the playout list under its own dedicated playout_mutex (not tech_pvt->mutex -
+    // see processIncomingMessage's append for why). This only needs to run after the bug
+    // was unlinked above, not under the same lock as that unlink: once the bug is
+    // unlinked, no future incoming message can reach the append code at all (its own bug
+    // lookup will come back null), and any append already in flight races us for
+    // playout_mutex instead of racing tech_pvt->mutex - whichever gets there first, the
+    // node is captured by one of us rather than silently orphaned (leaking the node and
+    // its temp audio file on disk).
+    switch_mutex_lock(tech_pvt->playout_mutex);
+    playout = tech_pvt->playout;
+    tech_pvt->playout = NULL;
+    switch_mutex_unlock(tech_pvt->playout_mutex);
 
     if (pAudioPipe && text) pAudioPipe->bufferForSending(text);
     if (pAudioPipe) pAudioPipe->close();
-
-    destroy_tech_pvt(tech_pvt);
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%u) fork_session_cleanup: connection closed\n", id);
+
+    // destroy_tech_pvt() is pure in-memory heap frees (speex/opus/circular buffers) -
+    // fast, so it stays on the calling thread. Only the std::remove() calls below do
+    // real (slow) filesystem I/O, so only those are deferred off the calling thread
+    // (which is holding session->bug_rwlock here). `playout` was already captured
+    // above, under tech_pvt->mutex.
+    //
+    // Re-take the mutex around the frees themselves: processIncomingBinary/
+    // dub_speech_frame/etc. all trylock this same mutex before touching
+    // streamingPlayoutBuffer/streamingPreBuffer, on the assumption that holding the
+    // lock keeps those buffers alive. Since the mutex is intentionally never destroyed
+    // (see destroy_tech_pvt), trylock always succeeds even after teardown - without
+    // this lock, destroy_tech_pvt's delete of those buffers races any such reader,
+    // giving either a use-after-free or (once nulled) a null deref.
+    switch_mutex_lock(tech_pvt->mutex);
+    destroy_tech_pvt(tech_pvt);
+    switch_mutex_unlock(tech_pvt->mutex);
+
+    g_fork_cleanup_threads.fetch_add(1, std::memory_order_relaxed);
+    std::thread([playout]() {
+      struct playout* p = playout;
+      while (p) {
+        std::remove(p->file);
+        free(p->file);
+        struct playout *tmp = p;
+        p = p->next;
+        free(tmp);
+        tmp = NULL;
+      }
+      g_fork_cleanup_threads.fetch_sub(1, std::memory_order_relaxed);
+    }).detach();
+
     return SWITCH_STATUS_SUCCESS;
   }
 
@@ -1151,8 +1258,14 @@ extern "C" {
   }
 
   switch_bool_t dub_speech_frame(switch_media_bug_t *bug, private_t* tech_pvt) {
-    CircularBuffer_t *cBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
     if (switch_mutex_trylock(tech_pvt->mutex) == SWITCH_STATUS_SUCCESS) {
+      // Read this under the lock, not before it - destroy_tech_pvt() frees and nulls
+      // it under this same mutex, so a pre-lock read here could be racing that free.
+      CircularBuffer_t *cBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
+      if (!cBuffer) {
+        switch_mutex_unlock(tech_pvt->mutex);
+        return SWITCH_TRUE;
+      }
 
       // if flag was set to clear the buffer, do so and clear the flag
       if (tech_pvt->clear_bidirectional_audio_buffer) {
@@ -1307,9 +1420,9 @@ extern "C" {
     }
     private_t* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
 
-    CircularBuffer_t *cBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
-
     if (switch_mutex_trylock(tech_pvt->mutex) == SWITCH_STATUS_SUCCESS) {
+      // Read under the lock - see dub_speech_frame for why a pre-lock read is unsafe.
+      CircularBuffer_t *cBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
       if (cBuffer != nullptr) {
         cBuffer->clear();
       }
