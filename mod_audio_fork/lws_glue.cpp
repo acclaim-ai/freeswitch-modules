@@ -989,6 +989,7 @@ extern "C" {
         struct playout *tmp = p;
         p = p->next;
         free(tmp);
+        tmp = NULL;
       }
       g_fork_cleanup_threads.fetch_sub(1, std::memory_order_relaxed);
     }).detach();
