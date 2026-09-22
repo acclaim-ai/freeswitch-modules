@@ -320,14 +320,18 @@ namespace {
 
             // add the file to the list of files played for this session, we'll delete when session
             // closes - locked against fork_session_cleanup's capture of tech_pvt->playout, which
-            // otherwise races this append (lws_glue.cpp: fork_session_cleanup)
+            // otherwise races this append (lws_glue.cpp: fork_session_cleanup). Uses the dedicated
+            // playout_mutex, not the general tech_pvt->mutex: this runs on the module's single
+            // shared lws service thread, and tech_pvt->mutex is held across real per-frame work
+            // elsewhere (resampling, OPUS encode) - blocking here on that mutex would stall
+            // WebSocket I/O for every other concurrent call, not just this one.
             struct playout* playout = (struct playout *) malloc(sizeof(struct playout));
             playout->file = (char *) malloc(strlen(szFilePath) + 1);
             strcpy(playout->file, szFilePath);
-            switch_mutex_lock(tech_pvt->mutex);
+            switch_mutex_lock(tech_pvt->playout_mutex);
             playout->next = tech_pvt->playout;
             tech_pvt->playout = playout;
-            switch_mutex_unlock(tech_pvt->mutex);
+            switch_mutex_unlock(tech_pvt->playout_mutex);
 
             jsonFile = cJSON_CreateString(szFilePath);
             cJSON_AddItemToObject(jsonData, "file", jsonFile);
@@ -574,6 +578,7 @@ namespace {
     tech_pvt->pAudioPipe = static_cast<void *>(ap);
 
     switch_mutex_init(&tech_pvt->mutex, SWITCH_MUTEX_NESTED, switch_core_session_get_pool(session));
+    switch_mutex_init(&tech_pvt->playout_mutex, SWITCH_MUTEX_NESTED, switch_core_session_get_pool(session));
 
     /* For OPUS encoding, force resampler target to 48kHz */
     int resamplerTarget = desiredSampling;
@@ -693,13 +698,14 @@ namespace {
       speex_resampler_destroy(tech_pvt->bidirectional_audio_resampler);
       tech_pvt->bidirectional_audio_resampler = nullptr;
     }
-    // tech_pvt->mutex is pool-owned (switch_mutex_init(..., session_pool)) - APR
-    // destroys it automatically, safely, when the session pool itself is destroyed
-    // (properly serialized behind session->rwlock). Destroying it manually here would
-    // race any in-flight processIncomingMessage call that's about to lock it (it's
-    // protected against the session disappearing via switch_core_session_locate, but
-    // not against fork_session_cleanup running concurrently on the session's own
-    // thread), so it's left for the pool to clean up instead of destroyed here.
+    // tech_pvt->mutex and tech_pvt->playout_mutex are pool-owned (switch_mutex_init(...,
+    // session_pool)) - APR destroys them automatically, safely, when the session pool
+    // itself is destroyed (properly serialized behind session->rwlock). Destroying
+    // either manually here would race any in-flight processIncomingMessage call that's
+    // about to lock it (it's protected against the session disappearing via
+    // switch_core_session_locate, but not against fork_session_cleanup running
+    // concurrently on the session's own thread), so they're left for the pool to clean
+    // up instead of destroyed here.
     if (tech_pvt->streamingPlayoutBuffer) {
       CircularBuffer_t *cBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
       delete cBuffer;
@@ -902,8 +908,20 @@ extern "C" {
       return SWITCH_STATUS_FALSE;
     }
 
-    if (SWITCH_STATUS_SUCCESS != fork_data_init(tech_pvt, session, host, port, path, sslFlags, samples_per_second, sampling, channels, 
+    if (SWITCH_STATUS_SUCCESS != fork_data_init(tech_pvt, session, host, port, path, sslFlags, samples_per_second, sampling, channels,
       bugname, metadata, bidirectional_audio_enable, bidirectional_audio_stream, bidirectional_audio_sample_rate, ws_codec, responseHandler)) {
+      // fork_data_init() may have already created the AudioPipe (stored in
+      // tech_pvt->pAudioPipe) before failing at a later step (resampler/OPUS encoder or
+      // decoder init). destroy_tech_pvt() never touches pAudioPipe - that's normally
+      // correct, since the live AudioPipe is owned by fork_session_cleanup/lws's own
+      // async close handling once connect() has run - but connect() is never reached on
+      // this failure path, so lws never learns this pipe exists and will never close or
+      // delete it. Safe to delete it directly here: nothing else can be concurrently
+      // using an AudioPipe that was never connected.
+      if (tech_pvt->pAudioPipe) {
+        delete static_cast<drachtio::AudioPipe*>(tech_pvt->pAudioPipe);
+        tech_pvt->pAudioPipe = nullptr;
+      }
       destroy_tech_pvt(tech_pvt);
       return SWITCH_STATUS_FALSE;
     }
@@ -948,16 +966,20 @@ extern "C" {
       }
     }
 
-    // Capture the playout list under the same lock that unlinks the bug from the
-    // channel, and under the same mutex processIncomingMessage takes before appending
-    // a new node. Once the bug is unlinked above, no future incoming message can reach
-    // that append code at all (its own bug lookup will come back null), and any append
-    // still in flight when we get here is safely captured below instead of racing us
-    // and being silently orphaned (leaking the node and its temp audio file on disk).
+    switch_mutex_unlock(tech_pvt->mutex);
+
+    // Capture the playout list under its own dedicated playout_mutex (not tech_pvt->mutex -
+    // see processIncomingMessage's append for why). This only needs to run after the bug
+    // was unlinked above, not under the same lock as that unlink: once the bug is
+    // unlinked, no future incoming message can reach the append code at all (its own bug
+    // lookup will come back null), and any append already in flight races us for
+    // playout_mutex instead of racing tech_pvt->mutex - whichever gets there first, the
+    // node is captured by one of us rather than silently orphaned (leaking the node and
+    // its temp audio file on disk).
+    switch_mutex_lock(tech_pvt->playout_mutex);
     playout = tech_pvt->playout;
     tech_pvt->playout = NULL;
-
-    switch_mutex_unlock(tech_pvt->mutex);
+    switch_mutex_unlock(tech_pvt->playout_mutex);
 
     if (pAudioPipe && text) pAudioPipe->bufferForSending(text);
     if (pAudioPipe) pAudioPipe->close();
