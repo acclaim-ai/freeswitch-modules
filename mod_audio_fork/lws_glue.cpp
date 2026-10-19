@@ -14,6 +14,7 @@
 #include <fstream>
 #include <sstream>
 #include <regex>
+#include <malloc.h>
 
 #include "base64.hpp"
 #include "parser.hpp"
@@ -41,6 +42,38 @@ typedef boost::circular_buffer<uint16_t> CircularBuffer_t;
 // count of detached fork_session_cleanup background threads still running,
 // so fork_cleanup() can wait for them to finish before the module unloads
 static std::atomic<int> g_fork_cleanup_threads{0};
+
+// memory-leak-hunting instrumentation (see audio_pipe.cpp's g_audiopipe_live for the
+// established pattern): per-call heap objects that currently have no create/destroy
+// lifecycle visibility at all, unlike AudioPipe. Logged on every create/destroy so a
+// load test's log can be grepped for "live=" to see whether each one's destructions
+// keep pace with creations, same as AudioPipe already does.
+static std::atomic<long> g_tech_pvt_live{0};
+static std::atomic<long> g_resampler_live{0};
+static std::atomic<long> g_opus_codec_live{0};
+
+// Logs glibc's own allocator view (arena/uordblks/fordblks - see mallinfo(3)) alongside
+// the live-object counters above, in the same freeswitch.log timeline as every call's
+// create/destroy events - so a load test's memory graph (sampled externally, e.g. via a
+// Grafana/Prometheus scrape of the same mallinfo numbers) can be correlated directly
+// against what this module was doing at that moment, without cross-referencing two
+// separate log sources by timestamp. Gated to every Nth call (not every single one):
+// mallinfo() itself is O(1) (glibc just returns counters it already maintains), but at
+// thousands of calls/sec the log line itself would otherwise dominate the log.
+static std::atomic<long> g_mallinfo_log_counter{0};
+#define MALLINFO_LOG_INTERVAL 20
+static void log_mallinfo_if_due(const char* event) {
+  if ((g_mallinfo_log_counter.fetch_add(1, std::memory_order_relaxed) + 1) % MALLINFO_LOG_INTERVAL != 0) return;
+  struct mallinfo2 mi = mallinfo2();
+  // audiopipe_live isn't included here - it's a separate counter local to audio_pipe.cpp,
+  // already logged on every single AudioPipe CREATED/DESTROYED line; grep/join on
+  // timestamp against this line if you need it alongside these numbers.
+  switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+    "mallinfo [%s] arena=%zu uordblks=%zu fordblks=%zu keepcost=%zu "
+    "tech_pvt_live=%ld resampler_live=%ld opus_codec_live=%ld\n",
+    event, mi.arena, mi.uordblks, mi.fordblks, mi.keepcost,
+    g_tech_pvt_live.load(), g_resampler_live.load(), g_opus_codec_live.load());
+}
 
 #define RTP_PACKETIZATION_PERIOD 20
 #define FRAME_SIZE_8000  320 /*which means each 20ms frame as 320 bytes at 8 khz (1 channel only)*/
@@ -603,6 +636,8 @@ namespace {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error initializing resampler: %s.\n", speex_resampler_strerror(err));
         return SWITCH_STATUS_FALSE;
       }
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "(%u) resampler CREATED live=%ld\n",
+        tech_pvt->id, ++g_resampler_live);
     }
     else {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%u) no resampling needed for this call\n", tech_pvt->id);
@@ -619,6 +654,8 @@ namespace {
           switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error initializing bidirectional audio resampler: %s.\n", speex_resampler_strerror(err));
           return SWITCH_STATUS_FALSE;
         }
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "(%u) bidirectional resampler CREATED live=%ld\n",
+          tech_pvt->id, ++g_resampler_live);
       }
     }
 
@@ -633,8 +670,10 @@ namespace {
         return SWITCH_STATUS_FALSE;
       }
       tech_pvt->opus_decoder = dec;
-      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, 
+      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
         "(%u) OPUS decoder initialized at 48000 Hz for bidirectional audio\n", tech_pvt->id);
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "(%u) opus codec CREATED live=%ld\n",
+        tech_pvt->id, ++g_opus_codec_live);
     }
 
     if (strcmp(ws_codec, "opus") == 0) {
@@ -684,7 +723,9 @@ namespace {
         opus_encoder_ctl(enc, OPUS_SET_BITRATE(opus_bitrate));
         opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(opus_complexity));
         tech_pvt->opus_encoder = enc;
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, 
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "(%u) opus codec CREATED live=%ld\n",
+          tech_pvt->id, ++g_opus_codec_live);
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
           "(%u) OPUS encoder: rate=48000 bitrate=%d complexity=%d app=%s\n",
           tech_pvt->id, opus_bitrate, opus_complexity,
           opus_app == OPUS_APPLICATION_AUDIO ? "audio" :
@@ -699,14 +740,20 @@ namespace {
   }
 
   void destroy_tech_pvt(private_t* tech_pvt) {
-    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "%s (%u) destroy_tech_pvt\n", tech_pvt->sessionId, tech_pvt->id);
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "%s (%u) destroy_tech_pvt tech_pvt_live=%ld\n",
+      tech_pvt->sessionId, tech_pvt->id, --g_tech_pvt_live);
+    log_mallinfo_if_due("tech_pvt DESTROYED");
     if (tech_pvt->resampler) {
       speex_resampler_destroy(tech_pvt->resampler);
       tech_pvt->resampler = nullptr;
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "(%u) resampler DESTROYED live=%ld\n",
+        tech_pvt->id, --g_resampler_live);
     }
     if (tech_pvt->bidirectional_audio_resampler) {
       speex_resampler_destroy(tech_pvt->bidirectional_audio_resampler);
       tech_pvt->bidirectional_audio_resampler = nullptr;
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "(%u) bidirectional resampler DESTROYED live=%ld\n",
+        tech_pvt->id, --g_resampler_live);
     }
     // tech_pvt->mutex and tech_pvt->playout_mutex are pool-owned (switch_mutex_init(...,
     // session_pool)) - APR destroys them automatically, safely, when the session pool
@@ -739,11 +786,15 @@ namespace {
     if (tech_pvt->opus_encoder) {
       opus_encoder_destroy((OpusEncoder*)tech_pvt->opus_encoder);
       tech_pvt->opus_encoder = nullptr;
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "(%u) opus codec DESTROYED live=%ld\n",
+        tech_pvt->id, --g_opus_codec_live);
     }
 
     if (tech_pvt->opus_decoder) {
       opus_decoder_destroy((OpusDecoder*)tech_pvt->opus_decoder);
       tech_pvt->opus_decoder = nullptr;
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "(%u) opus codec DESTROYED live=%ld\n",
+        tech_pvt->id, --g_opus_codec_live);
     }
 
   }
@@ -917,6 +968,19 @@ extern "C" {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "error allocating memory!\n");
       return SWITCH_STATUS_FALSE;
     }
+
+    // Counted here, unconditionally, rather than only after fork_data_init() succeeds:
+    // destroy_tech_pvt() decrements this counter unconditionally too (it's called on
+    // both the success-later-torn-down path and the fork_data_init-failure path via
+    // fork_session_destroy() below), so the create-side count must cover every tech_pvt
+    // that destroy_tech_pvt() could ever be called on, not just the ones that fully
+    // initialized.
+    // tech_pvt->id isn't assigned until fork_data_init() runs (just below), so this log
+    // identifies the instance by pointer instead, same as AudioPipe's own CREATED/
+    // DESTROYED log lines do for consistency.
+    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_NOTICE, "tech_pvt %p CREATED live=%ld\n",
+      (void*)tech_pvt, ++g_tech_pvt_live);
+    log_mallinfo_if_due("tech_pvt CREATED");
 
     if (SWITCH_STATUS_SUCCESS != fork_data_init(tech_pvt, session, host, port, path, sslFlags, samples_per_second, sampling, channels,
       bugname, metadata, bidirectional_audio_enable, bidirectional_audio_stream, bidirectional_audio_sample_rate, ws_codec, responseHandler)) {
