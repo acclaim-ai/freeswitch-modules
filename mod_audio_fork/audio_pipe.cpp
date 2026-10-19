@@ -121,7 +121,6 @@ int AudioPipe::lws_callback(struct lws *wsi,
         }
         else {
           switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,"AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_ESTABLISHED %s unable to find wsi %p..\n", ap->m_uuid.c_str(), wsi);
-          switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,"AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_ESTABLISHED %s unable to find wsi %p..\n", ap->m_uuid.c_str(), wsi);
         }
       }
       }
@@ -130,7 +129,6 @@ int AudioPipe::lws_callback(struct lws *wsi,
       {
         AudioPipe* ap = *ppAp;
         if (!ap) {
-          switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,"AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_CLOSED %s unable to find wsi %p..\n", ap->m_uuid.c_str(), wsi);
           switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,"AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_CLOSED %s unable to find wsi %p..\n", ap->m_uuid.c_str(), wsi);
           return 0;
         }
@@ -159,7 +157,6 @@ int AudioPipe::lws_callback(struct lws *wsi,
 
         AudioPipe* ap = *ppAp;
         if (!ap) {
-          switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,"AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_RECEIVE %s unable to find wsi %p..\n", ap->m_uuid.c_str(), wsi);
           switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,"AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_RECEIVE %s unable to find wsi %p..\n", ap->m_uuid.c_str(), wsi);
           return 0;
         }
@@ -232,7 +229,6 @@ int AudioPipe::lws_callback(struct lws *wsi,
       {
         AudioPipe* ap = *ppAp;
         if (!ap) {
-          switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,"AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_WRITEABLE %s unable to find wsi %p..\n", ap->m_uuid.c_str(), wsi);
           switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,"AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_WRITEABLE %s unable to find wsi %p..\n", ap->m_uuid.c_str(), wsi);
           return 0;
         }
@@ -516,13 +512,11 @@ bool AudioPipe::lws_service_thread() {
   info.keepalive_timeout = 5;           // seconds to allow remote client to hold on to an idle HTTP/1.1 connection
   info.timeout_secs_ah_idle = 10;       // secs to allow a client to hold an ah without using it
 //   info.retry_and_idle_policy = &retry;
-//   info.retry_and_idle_policy = &retry;
 
   switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,"AudioPipe::lws_service_thread creating context\n");
 
   context = lws_create_context(&info);
   if (!context) {
-    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,"AudioPipe::lws_service_thread failed creating context\n");
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,"AudioPipe::lws_service_thread failed creating context\n");
     return false;
   }
@@ -533,7 +527,6 @@ bool AudioPipe::lws_service_thread() {
   } while (n >= 0 && !stopFlag);
 
   lwsl_notice("AudioPipe::lws_service_thread ending\n");
-  lwsl_notice("AudioPipe::lws_service_thread ending\n");
   lws_context_destroy(context);
 
   return true;
@@ -542,8 +535,6 @@ bool AudioPipe::lws_service_thread() {
 void AudioPipe::initialize(const char* protocol, int loglevel, log_emit_function logger) {
   protocolName = protocol;
   lws_set_log_level(loglevel, logger);
-
-  switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,"AudioPipe::initialize starting\n");
   switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,"AudioPipe::initialize starting\n");
   std::lock_guard<std::mutex> lock(mapMutex);
   stopFlag = false;
@@ -551,7 +542,6 @@ void AudioPipe::initialize(const char* protocol, int loglevel, log_emit_function
 }
 
 bool AudioPipe::deinitialize() {
-  switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,"AudioPipe::deinitialize\n");
   switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,"AudioPipe::deinitialize\n");
   std::lock_guard<std::mutex> lock(mapMutex);
   stopFlag = true;
