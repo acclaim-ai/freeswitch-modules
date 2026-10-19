@@ -34,6 +34,8 @@ extern "C" {
 
 #include <opus/opus.h>
 
+#include <opus/opus.h>
+
 #include <boost/circular_buffer.hpp>
 
 
@@ -80,6 +82,7 @@ static void log_mallinfo_if_due(const char* event) {
 #define BUFFER_GROW_SIZE (16384)
 #define AUDIO_MARKER 0xFFFF
 #define OPUS_MAX_DECODE_SAMPLES 5760 /* 120ms at 48kHz - max OPUS frame */
+#define OPUS_MAX_DECODE_SAMPLES 5760 /* 120ms at 48kHz - max OPUS frame */
 #define MAX_MARKS (30)
 
 namespace {
@@ -101,6 +104,11 @@ namespace {
     return false;
   }
 
+  /* Forward declaration */
+  switch_status_t processIncomingBinary(private_t* tech_pvt, switch_core_session_t* session, const char* message, size_t dataLength);
+
+  /* OPUS frame duration in samples at 48kHz for 20ms frames */
+  #define OPUS_FRAME_SAMPLES 960
   /* Forward declaration */
   switch_status_t processIncomingBinary(private_t* tech_pvt, switch_core_session_t* session, const char* message, size_t dataLength);
 
@@ -264,6 +272,35 @@ namespace {
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Failed to get mutext (temp)\n");
 
     return SWITCH_STATUS_SUCCESS;
+  }
+
+  switch_status_t processIncomingOpusBinary(private_t* tech_pvt, switch_core_session_t* session, const char* data, size_t dataLength) {
+    if (!tech_pvt->opus_decoder) {
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "(%u) processIncomingOpusBinary - no OPUS decoder initialized\n", tech_pvt->id);
+      return SWITCH_STATUS_FALSE;
+    }
+
+    // Warn if the packet looks like concatenated OPUS frames
+    if (dataLength > 500) {
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, 
+        "(%u) processIncomingOpusBinary - received %zu bytes, likely CONCATENATED OPUS packets! "
+        "Each WS binary message must contain exactly ONE OPUS packet. Audio will be broken.\n",
+        tech_pvt->id, dataLength);
+    }
+
+    OpusDecoder *dec = (OpusDecoder*)tech_pvt->opus_decoder;
+    int16_t pcm[OPUS_MAX_DECODE_SAMPLES];
+    int samples = opus_decode(dec, (const unsigned char*)data, (opus_int32)dataLength, pcm, OPUS_MAX_DECODE_SAMPLES, 0);
+    if (samples < 0) {
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "(%u) processIncomingOpusBinary - OPUS decode error: %s (pkt_size=%zu)\n",
+        tech_pvt->id, opus_strerror(samples), dataLength);
+      return SWITCH_STATUS_FALSE;
+    }
+
+    if (samples == 0) return SWITCH_STATUS_SUCCESS;
+
+    // Feed decoded PCM into the existing binary processing pipeline
+    return processIncomingBinary(tech_pvt, session, (const char*)pcm, samples * sizeof(int16_t));
   }
 
   switch_status_t processIncomingOpusBinary(private_t* tech_pvt, switch_core_session_t* session, const char* data, size_t dataLength) {
@@ -539,6 +576,11 @@ namespace {
             } else {
               processIncomingBinary(tech_pvt, session, binary, len);
             }
+            if (strcmp(tech_pvt->ws_codec, "pcm") != 0 && tech_pvt->opus_decoder) {
+              processIncomingOpusBinary(tech_pvt, session, binary, len);
+            } else {
+              processIncomingBinary(tech_pvt, session, binary, len);
+            }
             break;
           }
         }
@@ -586,6 +628,13 @@ namespace {
     tech_pvt->clear_bidirectional_audio_buffer = false;
     tech_pvt->has_set_aside_byte = 0;
     tech_pvt->downscale_factor = 1;
+    {
+      /* For OPUS mode, decoded audio is always 48kHz regardless of bidir_rate */
+      int effective_bidir_rate = (strcmp(ws_codec, "pcm") != 0 && bidirectional_audio_sample_rate) ? 48000 : bidirectional_audio_sample_rate;
+      if (effective_bidir_rate > sampling) {
+        tech_pvt->downscale_factor = effective_bidir_rate / sampling;
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "downscale_factor is %d\n", tech_pvt->downscale_factor);
+      }
     {
       /* For OPUS mode, decoded audio is always 48kHz regardless of bidir_rate */
       int effective_bidir_rate = (strcmp(ws_codec, "pcm") != 0 && bidirectional_audio_sample_rate) ? 48000 : bidirectional_audio_sample_rate;
@@ -957,6 +1006,7 @@ extern "C" {
     int bidirectional_audio_stream,
     int bidirectional_audio_sample_rate,
     const char* ws_codec,
+    const char* ws_codec,
     void **ppUserData
     )
   {
@@ -1246,6 +1296,80 @@ extern "C" {
       }
       else {
       /* PCM path: write raw samples into AudioPipe binary buffer */
+      if (strcmp(tech_pvt->ws_codec, "opus") == 0 && tech_pvt->opus_encoder) {
+        /* OPUS encoding path: read PCM → resample to 48kHz (stereo) → downmix to mono → buffer 960 → opus_encode → WS */
+        uint8_t pcm_buf[SWITCH_RECOMMENDED_BUFFER_SIZE];
+        switch_frame_t frame = { 0 };
+        frame.data = pcm_buf;
+        frame.buflen = sizeof(pcm_buf);
+
+        /* Use tech_pvt->channels — it matches the media bug configuration (SMBF_STEREO)
+           and the resampler init (speex_resampler_init(channels, ...)).
+           rd_impl.number_of_channels reflects the SIP codec, which may differ from bug
+           output if SMBF_STEREO is set on a mono codec. */
+        int bug_channels = tech_pvt->channels;
+        while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS) {
+          if (frame.datalen) {
+            int16_t *pcm_data = (int16_t*)frame.data;
+            int pcm_samples = frame.datalen / (int)sizeof(int16_t); /* total interleaved samples */
+
+            /* Resample BEFORE downmix: resampler is initialized with bug_channels,
+               so it expects interleaved multi-channel data. Downmixing first would
+               feed mono data to a stereo resampler → buffer overread. */
+            int16_t resampled[OPUS_MAX_DECODE_SAMPLES * 2]; /* room for stereo after resample */
+            if (tech_pvt->resampler) {
+              spx_uint32_t in_len = pcm_samples / bug_channels; /* per-channel frames */
+              spx_uint32_t out_len = OPUS_MAX_DECODE_SAMPLES;
+              speex_resampler_process_interleaved_int(tech_pvt->resampler,
+                (const spx_int16_t*)pcm_data, &in_len,
+                (spx_int16_t*)resampled, &out_len);
+              pcm_data = resampled;
+              pcm_samples = out_len * bug_channels; /* total interleaved after resample */
+            }
+
+            /* Downmix to mono AFTER resampling (OPUS encoder is always mono) */
+            int mono_samples;
+            if (bug_channels > 1 && pcm_samples > 0) {
+              mono_samples = pcm_samples / bug_channels;
+              for (int i = 0; i < mono_samples; i++) {
+                int32_t sum = 0;
+                for (int ch = 0; ch < bug_channels; ch++)
+                  sum += (int32_t)pcm_data[i * bug_channels + ch];
+                pcm_data[i] = (int16_t)(sum / bug_channels);
+              }
+            } else {
+              mono_samples = pcm_samples;
+            }
+
+            /* Accumulate into 960-sample buffer (20ms @ 48kHz) before encoding */
+            int offset = 0;
+            while (offset < mono_samples) {
+              int space = OPUS_FRAME_SAMPLES - tech_pvt->opus_encode_buf_len;
+              int to_copy = std::min(space, mono_samples - offset);
+              memcpy(tech_pvt->opus_encode_buf + tech_pvt->opus_encode_buf_len,
+                     pcm_data + offset, to_copy * sizeof(int16_t));
+              tech_pvt->opus_encode_buf_len += to_copy;
+              offset += to_copy;
+
+              if (tech_pvt->opus_encode_buf_len == OPUS_FRAME_SAMPLES) {
+                unsigned char opus_pkt[4000];
+                int opus_bytes = opus_encode((OpusEncoder*)tech_pvt->opus_encoder,
+                  tech_pvt->opus_encode_buf, OPUS_FRAME_SAMPLES, opus_pkt, sizeof(opus_pkt));
+                if (opus_bytes > 0) {
+                  pAudioPipe->queueBinaryPacket(opus_pkt, opus_bytes);
+                } else if (opus_bytes < 0) {
+                  switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                    "(%u) OPUS encode error: %s\n", tech_pvt->id, opus_strerror(opus_bytes));
+                }
+                tech_pvt->opus_encode_buf_len = 0;
+              }
+            }
+          }
+        }
+        switch_mutex_unlock(tech_pvt->mutex);
+      }
+      else {
+      /* PCM path: write raw samples into AudioPipe binary buffer */
       pAudioPipe->lockAudioBuffer();
       size_t available = pAudioPipe->binarySpaceAvailable();
       if (NULL == tech_pvt->resampler) {
@@ -1317,6 +1441,7 @@ extern "C" {
       pAudioPipe->unlockAudioBuffer();
       switch_mutex_unlock(tech_pvt->mutex);
       } /* end PCM path */
+      } /* end PCM path */
     }
     return SWITCH_TRUE;
   }
@@ -1363,6 +1488,13 @@ extern "C" {
         switch_frame_t* rframe = switch_core_media_bug_get_write_replace_frame(bug);
         int16_t *fp = reinterpret_cast<int16_t*>(rframe->data);
 
+        /* Get write codec channel count to determine if we need mono→stereo expansion.
+           The playout buffer always contains mono PCM (from OPUS decode at 48kHz).
+           If the SIP write codec is stereo, we must duplicate mono into both channels. */
+        switch_core_session_t *session = switch_core_media_bug_get_session(bug);
+        switch_codec_implementation_t wr_impl;
+        switch_core_session_get_write_impl(session, &wr_impl);
+        int write_channels = wr_impl.number_of_channels;
         /* Get write codec channel count to determine if we need mono→stereo expansion.
            The playout buffer always contains mono PCM (from OPUS decode at 48kHz).
            If the SIP write codec is stereo, we must duplicate mono into both channels. */
@@ -1438,6 +1570,17 @@ extern "C" {
             } else {
               vector_add(fp, data, validSamplesCopied);
             }
+            if (write_channels > 1) {
+              int16_t stereo_data[SWITCH_RECOMMENDED_BUFFER_SIZE];
+              memset(stereo_data, 0, sizeof(stereo_data));
+              for (int i = 0; i < validSamplesCopied; i++) {
+                stereo_data[2*i] = data[i];
+                stereo_data[2*i+1] = data[i];
+              }
+              vector_add(fp, stereo_data, rframe->samples * write_channels);
+            } else {
+              vector_add(fp, data, validSamplesCopied);
+            }
           }
         }
         else {
@@ -1445,6 +1588,17 @@ extern "C" {
           cBuffer->erase(cBuffer->begin(), cBuffer->begin() + samplesToCopy);
 
           if (samplesToCopy > 0) {
+            if (write_channels > 1) {
+              int16_t stereo_data[SWITCH_RECOMMENDED_BUFFER_SIZE];
+              memset(stereo_data, 0, sizeof(stereo_data));
+              for (int i = 0; i < samplesToCopy; i++) {
+                stereo_data[2*i] = data[i];
+                stereo_data[2*i+1] = data[i];
+              }
+              vector_add(fp, stereo_data, rframe->samples * write_channels);
+            } else {
+              vector_add(fp, data, rframe->samples);
+            }
             if (write_channels > 1) {
               int16_t stereo_data[SWITCH_RECOMMENDED_BUFFER_SIZE];
               memset(stereo_data, 0, sizeof(stereo_data));
@@ -1466,6 +1620,7 @@ extern "C" {
               tech_pvt->id, name.c_str());
           }
         }
+        vector_normalize(fp, rframe->samples * write_channels);
         vector_normalize(fp, rframe->samples * write_channels);
 
         switch_core_media_bug_set_write_replace_frame(bug, rframe);
