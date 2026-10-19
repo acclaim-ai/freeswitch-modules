@@ -146,7 +146,6 @@ int AudioPipe::lws_callback(struct lws *wsi,
         ap->m_state = LWS_CLIENT_DISCONNECTED;
 
         //NB: after receiving any of the events above, any holder of a
-        //NB: after receiving any of the events above, any holder of a
         //pointer or reference to this object must treat is as no longer valid
 
         *ppAp = NULL;
