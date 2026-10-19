@@ -35,6 +35,12 @@ typedef void (*responseHandler_t)(switch_core_session_t* session, const char* ev
 
 struct private_data {
 	switch_mutex_t *mutex;
+	// Dedicated lock for the `playout` list only (see below). Kept separate from
+	// `mutex` because `mutex` is also held across real per-frame work (resampling,
+	// OPUS encode - see fork_frame/dub_speech_frame), and this list is appended to
+	// from the module's single shared lws service thread - blocking that thread on
+	// `mutex` would stall WebSocket I/O for every other concurrent call.
+	switch_mutex_t *playout_mutex;
 	char sessionId[MAX_SESSION_ID];
   char bugname[MAX_BUG_LEN+1];
   SpeexResamplerState *resampler;

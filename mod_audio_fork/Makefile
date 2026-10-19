@@ -27,7 +27,7 @@ ifeq ($(AVX2),1)
     SIMD_FLAGS := -mavx2 -DUSE_AVX2
 endif
 
-COMMON_FLAGS := -fPIC -O2 -Wall -I$(FS_INC) $(PKG_CFLAGS) $(SIMD_FLAGS)
+COMMON_FLAGS := -fPIC -O2 -g -Wall -I$(FS_INC) $(PKG_CFLAGS) $(SIMD_FLAGS)
 
 CFLAGS    += $(COMMON_FLAGS)
 CXXFLAGS  += $(COMMON_FLAGS) -std=c++11

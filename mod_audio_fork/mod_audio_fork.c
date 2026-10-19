@@ -107,6 +107,11 @@ static switch_status_t start_capture(switch_core_session_t *session,
 
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "adding bug %s.\n", bugname);
 	if ((status = switch_core_media_bug_add(session, bugname, NULL, capture_callback, pUserData, 0, flags, &bug)) != SWITCH_STATUS_SUCCESS) {
+		// fork_session_init() above already succeeded - pUserData/its AudioPipe are live,
+		// but no bug ever got attached to the channel, so fork_session_cleanup (which
+		// looks the bug up via the channel's private data) would never find anything to
+		// clean up here. Tear it down directly instead.
+		fork_session_destroy(&pUserData);
 		return status;
 	}
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "setting bug private data %s.\n", bugname);

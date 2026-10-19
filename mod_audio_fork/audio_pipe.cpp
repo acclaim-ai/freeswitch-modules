@@ -1,6 +1,7 @@
 #include "audio_pipe.hpp"
 #include <switch.h>
 
+#include <atomic>
 #include <cassert>
 #include <iostream>
 
@@ -16,6 +17,11 @@ namespace {
 
   static const char *requestedTcpKeepaliveSecs = std::getenv("MOD_AUDIO_FORK_TCP_KEEPALIVE_SECS");
   static int nTcpKeepaliveSecs = requestedTcpKeepaliveSecs ? ::atoi(requestedTcpKeepaliveSecs) : 55;
+
+  // temporary leak-hunting instrumentation: how many AudioPipe objects are currently
+  // alive. Logged on every create/destroy so a load test's log can be grepped for
+  // "AudioPipe live=" to see whether destructions actually keep pace with creations.
+  static std::atomic<long> g_audiopipe_live{0};
 }
 
 // remove once we update to lws with this helper
@@ -89,6 +95,12 @@ int AudioPipe::lws_callback(struct lws *wsi,
         if (ap) {
           ap->m_state = LWS_CLIENT_FAILED;
           ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(), AudioPipe::CONNECT_FAIL, (char *) in, NULL, len);
+          // connect() never succeeded - nothing else will ever free this (there's no wsi
+          // left to generate a LWS_CALLBACK_CLIENT_CLOSED, the only other place that
+          // deletes an AudioPipe). m_callback() above already notified tech_pvt and
+          // (via eventCallback's CONNECT_FAIL case) nulled tech_pvt->pAudioPipe, so
+          // nothing else references `ap` by the time we get here.
+          delete ap;
         }
         else {
           switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,"AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_CONNECTION_ERROR unable to find wsi %p..\n", wsi);
@@ -329,7 +341,21 @@ void AudioPipe::processPendingConnects(lws_per_vhost_data *vhd) {
   }
   for (auto it = connects.begin(); it != connects.end(); ++it) {
     AudioPipe* ap = *it;
-    ap->connect_client(vhd);
+    if (!ap->connect_client(vhd)) {
+      // lws_client_connect_via_info() failed synchronously - no wsi was ever created,
+      // so no LWS_CALLBACK_CLIENT_CONNECTION_ERROR/ESTABLISHED will ever fire for this
+      // attempt (there's nothing to generate one). Notify and clean up here instead,
+      // exactly as the async failure path (LWS_CALLBACK_CLIENT_CONNECTION_ERROR) does -
+      // this pipe is stuck in LWS_CLIENT_CONNECTING with a null m_wsi and nothing else
+      // will ever remove or free it otherwise.
+      {
+        std::lock_guard<std::mutex> guard(mutex_connects);
+        pendingConnects.remove(ap);
+      }
+      ap->m_state = LWS_CLIENT_FAILED;
+      ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(), AudioPipe::CONNECT_FAIL, "connect failed", NULL, 0);
+      delete ap;
+    }
   }
 }
 
@@ -507,8 +533,12 @@ AudioPipe::AudioPipe(const char* uuid, const char* host, unsigned int port, cons
   }
   m_bidirectional_audio_stream = bidirectional_audio_stream;
   m_audio_buffer = new uint8_t[m_audio_buffer_max_len];
+  switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "AudioPipe %s CREATED live=%ld\n",
+    m_uuid.c_str(), ++g_audiopipe_live);
 }
 AudioPipe::~AudioPipe() {
+  switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "AudioPipe %s DESTROYED live=%ld\n",
+    m_uuid.c_str(), --g_audiopipe_live);
   if (m_audio_buffer) delete [] m_audio_buffer;
   if (m_recv_buf) free(m_recv_buf);
 }
