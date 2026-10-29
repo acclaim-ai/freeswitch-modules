@@ -1,0 +1,6 @@
+# CODEOWNERS file
+# This file defines individuals or teams that are responsible
+# for code in this repository.
+
+# Global owners for all files
+* @acclaim-ai/team-telephony
