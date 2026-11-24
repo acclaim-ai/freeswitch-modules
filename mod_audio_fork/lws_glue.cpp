@@ -1288,7 +1288,7 @@ extern "C" {
         frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
         while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS) {
           if (frame.datalen) {
-            spx_uint32_t out_len = available >> 1;  // space for samples which are 2 bytes
+            spx_uint32_t out_len = available / (2 * tech_pvt->channels);  // per-channel frames of 2-byte samples
             spx_uint32_t in_len = frame.samples;
 
             speex_resampler_process_interleaved_int(tech_pvt->resampler, 
