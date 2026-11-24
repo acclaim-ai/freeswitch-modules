@@ -609,10 +609,15 @@ namespace {
     strncpy(tech_pvt->bugname, bugname, MAX_BUG_LEN);
     if (metadata) strncpy(tech_pvt->initialMetadata, metadata, MAX_METADATA_LEN);
     
-    size_t buflen = LWS_PRE + (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * 1000 / RTP_PACKETIZATION_PERIOD * nAudioBufferSecs);
+    size_t buflen = FRAME_SIZE_8000 * desiredSampling / 8000 * channels * 1000 / RTP_PACKETIZATION_PERIOD * nAudioBufferSecs;
 
-    drachtio::AudioPipe* ap = new drachtio::AudioPipe(tech_pvt->sessionId, host, port, path, sslFlags, 
-      buflen, read_impl.decoded_bytes_per_packet, username, password, bugname, bidirectional_audio_stream_enable, eventCallback);
+    // opt-in: prepend a seq + send-timestamp header to every outgoing binary WS message
+    // (layout in audio_pipe.hpp) so the receiver can measure FS -> WS server latency
+    int timestamp_header = switch_true(switch_channel_get_variable(channel, "AUDIO_FORK_TIMESTAMP_HEADER"));
+
+    drachtio::AudioPipe* ap = new drachtio::AudioPipe(tech_pvt->sessionId, host, port, path, sslFlags,
+      buflen, read_impl.decoded_bytes_per_packet, username, password, bugname, bidirectional_audio_stream_enable,
+      timestamp_header, eventCallback);
     if (!ap) {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error allocating AudioPipe\n");
       return SWITCH_STATUS_FALSE;
@@ -1262,7 +1267,7 @@ extern "C" {
             }
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) dropping packets!\n", 
               tech_pvt->id);
-            pAudioPipe->binaryWritePtrResetToZero();
+            pAudioPipe->binaryWritePtrReset();
 
             frame.data = pAudioPipe->binaryWritePtr();
             frame.buflen = available = pAudioPipe->binarySpaceAvailable();

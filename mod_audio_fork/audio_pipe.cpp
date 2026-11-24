@@ -24,6 +24,10 @@ namespace {
   static std::atomic<long> g_audiopipe_live{0};
 }
 
+// out-of-class definitions for the in-class initialized static constants (C++11 ODR)
+const uint8_t AudioPipe::TS_HEADER_VERSION;
+const size_t AudioPipe::TS_HEADER_LEN;
+
 // remove once we update to lws with this helper
 static int dch_lws_http_basic_auth_gen(const char *user, const char *pw, char *buf, size_t len) {
 	size_t n = strlen(user), m = strlen(pw);
@@ -65,8 +69,17 @@ int AudioPipe::lws_callback(struct lws *wsi,
     case LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER:
       {
         AudioPipe* ap = findPendingConnect(wsi);
-        if (ap && ap->hasBasicAuth()) {
-          unsigned char **p = (unsigned char **)in, *end = (*p) + len;
+        if (!ap) break;
+        unsigned char **p = (unsigned char **)in, *end = (*p) + len;
+
+        // tell the server up front that binary messages carry the timestamp header (value = header version)
+        if (ap->m_ts_header_len > 0) {
+          static_assert(TS_HEADER_VERSION < 10, "version is sent as a single digit");
+          const unsigned char version = '0' + TS_HEADER_VERSION;
+          if (lws_add_http_header_by_name(wsi, (const unsigned char *) "x-audio-fork-timestamp-header:", &version, 1, p, end)) return -1;
+        }
+
+        if (ap->hasBasicAuth()) {
           char b[128];
           std::string username, password;
 
@@ -267,13 +280,11 @@ int AudioPipe::lws_callback(struct lws *wsi,
         {
           std::lock_guard<std::mutex> lk(ap->m_audio_mutex);
           if (!ap->m_binary_packet_queue.empty()) {
-            auto& packet = ap->m_binary_packet_queue.front();
-            size_t pktLen = packet.size();
-            std::vector<uint8_t> buf(pktLen + LWS_PRE);
-            memcpy(buf.data() + LWS_PRE, packet.data(), pktLen);
+            // queued with LWS_PRE + header headroom already reserved (see queueBinaryPacket) - send in place
+            std::vector<uint8_t> packet = std::move(ap->m_binary_packet_queue.front());
             ap->m_binary_packet_queue.pop();
-            lws_write(wsi, buf.data() + LWS_PRE, pktLen, LWS_WRITE_BINARY);
-            if (!ap->m_binary_packet_queue.empty() || ap->m_audio_buffer_write_offset > LWS_PRE) {
+            ap->sendBinary(wsi, packet.data() + LWS_PRE, packet.size() - LWS_PRE);
+            if (!ap->m_binary_packet_queue.empty() || ap->m_audio_buffer_write_offset > ap->dataStartOffset()) {
               lws_callback_on_writable(wsi);
             }
             return 0;
@@ -283,14 +294,14 @@ int AudioPipe::lws_callback(struct lws *wsi,
         // check for audio packets (PCM flat buffer)
         {
           std::lock_guard<std::mutex> lk(ap->m_audio_mutex);
-          if (ap->m_audio_buffer_write_offset > LWS_PRE) {
+          if (ap->m_audio_buffer_write_offset > ap->dataStartOffset()) {
             size_t datalen = ap->m_audio_buffer_write_offset - LWS_PRE;
-            int sent = lws_write(wsi, (unsigned char *) ap->m_audio_buffer + LWS_PRE, datalen, LWS_WRITE_BINARY);
+            int sent = ap->sendBinary(wsi, ap->m_audio_buffer + LWS_PRE, datalen);
             if (sent < datalen) {
               switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,"AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_WRITEABLE %s attemped to send %lu only sent %d wsi %p..\n",
                 ap->m_uuid.c_str(), datalen, sent, wsi);
             }
-            ap->m_audio_buffer_write_offset = LWS_PRE;
+            ap->m_audio_buffer_write_offset = ap->dataStartOffset();
           }
         }
 
@@ -521,20 +532,23 @@ bool AudioPipe::deinitialize() {
 // instance members
 AudioPipe::AudioPipe(const char* uuid, const char* host, unsigned int port, const char* path,
   int sslFlags, size_t bufLen, size_t minFreespace, const char* username, const char* password, char* bugname,
-  int bidirectional_audio_stream, notifyHandler_t callback) :
+  int bidirectional_audio_stream, int timestamp_header, notifyHandler_t callback) :
   m_uuid(uuid), m_host(host), m_port(port), m_path(path), m_sslFlags(sslFlags),
-  m_audio_buffer_min_freespace(minFreespace), m_audio_buffer_max_len(bufLen), m_gracefulShutdown(false),
-  m_audio_buffer_write_offset(LWS_PRE), m_recv_buf(nullptr), m_recv_buf_ptr(nullptr), m_bugname(bugname),
-  m_state(LWS_CLIENT_IDLE), m_wsi(nullptr), m_vhd(nullptr), m_callback(callback) {
+  m_audio_buffer_min_freespace(minFreespace), m_gracefulShutdown(false),
+  m_recv_buf(nullptr), m_recv_buf_ptr(nullptr), m_bugname(bugname),
+  m_state(LWS_CLIENT_IDLE), m_wsi(nullptr), m_vhd(nullptr), m_callback(callback),
+  m_ts_header_len(timestamp_header ? TS_HEADER_LEN : 0), m_ts_header_seq(0) {
 
   if (username && password) {
     m_username.assign(username);
     m_password.assign(password);
   }
   m_bidirectional_audio_stream = bidirectional_audio_stream;
+  m_audio_buffer_max_len = dataStartOffset() + bufLen;
+  m_audio_buffer_write_offset = dataStartOffset();
   m_audio_buffer = new uint8_t[m_audio_buffer_max_len];
-  switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "AudioPipe %s CREATED live=%ld\n",
-    m_uuid.c_str(), ++g_audiopipe_live);
+  switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "AudioPipe %s CREATED live=%ld timestamp_header=%s\n",
+    m_uuid.c_str(), ++g_audiopipe_live, m_ts_header_len > 0 ? "on" : "off");
 }
 AudioPipe::~AudioPipe() {
   switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "AudioPipe %s DESTROYED live=%ld\n",
@@ -583,17 +597,33 @@ void AudioPipe::bufferForSending(const char* text) {
 }
 
 void AudioPipe::unlockAudioBuffer() {
-  if (m_audio_buffer_write_offset > LWS_PRE) addPendingWrite(this);
+  if (m_audio_buffer_write_offset > dataStartOffset()) addPendingWrite(this);
   m_audio_mutex.unlock();
 }
 
 void AudioPipe::queueBinaryPacket(const uint8_t* data, size_t len) {
   if (m_state != LWS_CLIENT_CONNECTED) return;
+  // reserve LWS_PRE + header headroom so the service thread can send it without another copy
+  std::vector<uint8_t> packet(dataStartOffset() + len);
+  memcpy(packet.data() + dataStartOffset(), data, len);
   {
     std::lock_guard<std::mutex> lk(m_audio_mutex);
-    m_binary_packet_queue.push(std::vector<uint8_t>(data, data + len));
+    m_binary_packet_queue.push(std::move(packet));
   }
   addPendingWrite(this);
+}
+
+int AudioPipe::sendBinary(struct lws *wsi, uint8_t *msg, size_t len) {
+  if (m_ts_header_len > 0) {
+    msg[0] = TS_HEADER_VERSION;
+    msg[1] = TS_HEADER_LEN;
+    lws_ser_wu16be(msg + 2, 0);
+    lws_ser_wu32be(msg + 4, m_ts_header_seq++);
+    // switch_time_now() is the uncached wall clock; switch_micro_time_now() may return a
+    // cached ~1ms timer value. The receiver compares this against its own clock.
+    lws_ser_wu64be(msg + 8, (uint64_t) switch_time_now());
+  }
+  return lws_write(wsi, msg, len, LWS_WRITE_BINARY);
 }
 
 void AudioPipe::close() {

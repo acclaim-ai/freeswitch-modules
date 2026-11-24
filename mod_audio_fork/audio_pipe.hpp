@@ -1,12 +1,14 @@
 #ifndef __AUDIO_PIPE_HPP__
 #define __AUDIO_PIPE_HPP__
 
+#include <cstdint>
 #include <string>
 #include <list>
 #include <mutex>
 #include <queue>
 #include <unordered_map>
 #include <thread>
+#include <vector>
 
 #include <libwebsockets.h>
 
@@ -44,9 +46,10 @@ namespace drachtio {
     static bool lws_service_thread();
 
     // constructor
-    AudioPipe(const char* uuid, const char* host, unsigned int port, const char* path, int sslFlags, 
+    // bufLen: PCM payload capacity in bytes (LWS_PRE and header headroom are added internally)
+    AudioPipe(const char* uuid, const char* host, unsigned int port, const char* path, int sslFlags,
       size_t bufLen, size_t minFreespace, const char* username, const char* password, char* bugname,
-      int bidirectional_audio, notifyHandler_t callback);
+      int bidirectional_audio, int timestamp_header, notifyHandler_t callback);
     ~AudioPipe();  
 
     LwsState_t getLwsState(void) { return m_state; }
@@ -64,8 +67,9 @@ namespace drachtio {
     void binaryWritePtrAdd(size_t len) {
       m_audio_buffer_write_offset += len;
     }
-    void binaryWritePtrResetToZero(void) {
-      m_audio_buffer_write_offset = 0;
+    // discard buffered (unsent) audio; leaves room for LWS_PRE and the optional timestamp header
+    void binaryWritePtrReset(void) {
+      m_audio_buffer_write_offset = dataStartOffset();
     }
     void lockAudioBuffer(void) {
       m_audio_mutex.lock();
@@ -127,6 +131,27 @@ namespace drachtio {
     
     bool connect_client(struct lws_per_vhost_data *vhd);
 
+    // Optional timestamp header prepended to every outgoing binary WS message when
+    // enabled (AUDIO_FORK_TIMESTAMP_HEADER channel var). Layout, big-endian:
+    //   [0]     version      (TS_HEADER_VERSION)
+    //   [1]     header_len   (TS_HEADER_LEN) - readers skip this many bytes
+    //   [2..3]  reserved     (0)
+    //   [4..7]  seq          uint32, per WS connection, +1 per binary message, starts at 0
+    //   [8..15] send_ts_us   uint64, microseconds since Unix epoch, taken right before lws_write
+    // The graceful-shutdown zero-length binary frame is never wrapped.
+    static const uint8_t TS_HEADER_VERSION = 1;
+    static const size_t TS_HEADER_LEN = 16;
+
+    // offset where binary payload starts, in m_audio_buffer and in queued packets:
+    // LWS_PRE headroom + optional timestamp header slot
+    size_t dataStartOffset(void) const {
+      return LWS_PRE + m_ts_header_len;
+    }
+
+    // send one binary media message; `msg` points just past LWS_PRE at the header slot
+    // (if enabled), `len` covers header slot + payload. Stamps the header, then lws_write.
+    int sendBinary(struct lws *wsi, uint8_t *msg, size_t len);
+
     LwsState_t m_state;
     std::string m_uuid;
     std::string m_host;
@@ -153,6 +178,9 @@ namespace drachtio {
     bool m_gracefulShutdown;
     bool m_bidirectional_audio_stream;
     std::queue<std::vector<uint8_t>> m_binary_packet_queue;
+    const size_t m_ts_header_len;  // 0 (disabled) or TS_HEADER_LEN
+    // only read/written on the lws service thread (LWS_CALLBACK_CLIENT_WRITEABLE), so no lock
+    uint32_t m_ts_header_seq;
   };
 
 } // namespace drachtio
