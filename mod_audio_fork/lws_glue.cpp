@@ -611,8 +611,6 @@ namespace {
     
     size_t buflen = FRAME_SIZE_8000 * desiredSampling / 8000 * channels * 1000 / RTP_PACKETIZATION_PERIOD * nAudioBufferSecs;
 
-    // opt-in: prepend a seq + send-timestamp header to every outgoing binary WS message
-    // (layout in audio_pipe.hpp) so the receiver can measure FS -> WS server latency
     int timestamp_header = switch_true(switch_channel_get_variable(channel, "AUDIO_FORK_TIMESTAMP_HEADER"));
 
     drachtio::AudioPipe* ap = new drachtio::AudioPipe(tech_pvt->sessionId, host, port, path, sslFlags,

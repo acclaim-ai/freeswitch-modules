@@ -24,7 +24,6 @@ namespace {
   static std::atomic<long> g_audiopipe_live{0};
 }
 
-// out-of-class definitions for the in-class initialized static constants (C++11 ODR)
 const uint8_t AudioPipe::TS_HEADER_VERSION;
 const size_t AudioPipe::TS_HEADER_LEN;
 
@@ -72,7 +71,6 @@ int AudioPipe::lws_callback(struct lws *wsi,
         if (!ap) break;
         unsigned char **p = (unsigned char **)in, *end = (*p) + len;
 
-        // tell the server up front that binary messages carry the timestamp header (value = header version)
         if (ap->m_ts_header_len > 0) {
           static_assert(TS_HEADER_VERSION < 10, "version is sent as a single digit");
           const unsigned char version = '0' + TS_HEADER_VERSION;
@@ -280,7 +278,6 @@ int AudioPipe::lws_callback(struct lws *wsi,
         {
           std::lock_guard<std::mutex> lk(ap->m_audio_mutex);
           if (!ap->m_binary_packet_queue.empty()) {
-            // queued with LWS_PRE + header headroom already reserved (see queueBinaryPacket) - send in place
             std::vector<uint8_t> packet = std::move(ap->m_binary_packet_queue.front());
             ap->m_binary_packet_queue.pop();
             ap->sendBinary(wsi, packet.data() + LWS_PRE, packet.size() - LWS_PRE);
@@ -603,7 +600,6 @@ void AudioPipe::unlockAudioBuffer() {
 
 void AudioPipe::queueBinaryPacket(const uint8_t* data, size_t len) {
   if (m_state != LWS_CLIENT_CONNECTED) return;
-  // reserve LWS_PRE + header headroom so the service thread can send it without another copy
   std::vector<uint8_t> packet(dataStartOffset() + len);
   memcpy(packet.data() + dataStartOffset(), data, len);
   {
@@ -619,8 +615,7 @@ int AudioPipe::sendBinary(struct lws *wsi, uint8_t *msg, size_t len) {
     msg[1] = TS_HEADER_LEN;
     lws_ser_wu16be(msg + 2, 0);
     lws_ser_wu32be(msg + 4, m_ts_header_seq++);
-    // switch_time_now() is the uncached wall clock; switch_micro_time_now() may return a
-    // cached ~1ms timer value. The receiver compares this against its own clock.
+    // not switch_micro_time_now(): that can be a cached ~1ms timer value
     lws_ser_wu64be(msg + 8, (uint64_t) switch_time_now());
   }
   return lws_write(wsi, msg, len, LWS_WRITE_BINARY);
