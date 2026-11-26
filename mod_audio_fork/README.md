@@ -1,5 +1,14 @@
 # mod_audio_fork
 
+> **Modified version.** This module is modified from the original [jambonz/freeswitch-modules](https://github.com/jambonz/freeswitch-modules) `mod_audio_fork`. Changes started in 2025-06, and the latest is from 2026-11-26. They include:
+>
+> - OPUS mode
+> - a standalone Makefile
+> - session cleanup and thread-leak fixes
+> - the opt-in timestamp header
+>
+> See the git history for the full list. It is distributed under the AGPL-3.0; see [COPYING](../COPYING.md).
+
 A Freeswitch module that attaches a bug to a media server endpoint and streams audio via websockets to a remote server. Supports two modes:
 
 - **PCM mode** (default) — streams L16 (16-bit linear PCM) audio
@@ -37,6 +46,12 @@ These variables can be set on the channel (`set` in dialplan) before calling `uu
 | `AUDIO_FORK_OPUS_BITRATE` | 6000–510000 | 32000 | Target bitrate in bps. Higher = better quality, more bandwidth. 16–64k recommended for voice, 96–128k for music. |
 | `AUDIO_FORK_OPUS_COMPLEXITY` | 0–10 | 6 | Encoder effort. Higher = better quality at same bitrate, more CPU. 4–6 recommended for VoIP. |
 | `AUDIO_FORK_OPUS_APPLICATION` | voip / audio / lowdelay | voip | `voip` — optimized for speech. `audio` — better for music/mixed content. `lowdelay` — lowest latency. |
+
+##### Latency tracking
+
+| Variable | Values | Default | Description |
+|----------|--------|---------|-------------|
+| `AUDIO_FORK_TIMESTAMP_HEADER` | true / false | false | Prepend a 16-byte header (sequence number + send timestamp) to every outgoing binary WebSocket message. See [Timestamp header](#timestamp-header). |
 
 Example (dialplan):
 ```xml
@@ -115,6 +130,26 @@ Closes websocket connection and detaches media bug, optionally sending a final t
 - **Text frame** (first): metadata JSON
 - **Binary frames** (outgoing): Raw OPUS packets, one per WebSocket message (20ms frames at 48kHz)
 - **Binary frames** (incoming/bidirectional): Raw OPUS packets, one per WebSocket message
+
+#### Timestamp header
+
+When the channel variable `AUDIO_FORK_TIMESTAMP_HEADER=true` is set before `uuid_audio_fork start`, every outgoing binary message (both PCM and OPUS mode) starts with this header. The receiver can use it to measure FreeSWITCH → server latency per message.
+
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0 | 1 | `version` | Header version, currently `1` |
+| 1 | 1 | `header_len` | Header length in bytes, currently `16`. Skip this many bytes to reach the payload, so that later versions can append fields. |
+| 2 | 2 | reserved | `0` |
+| 4 | 4 | `seq` | uint32, big-endian. Starts at `0` for each WebSocket connection and goes up by 1 per binary message. |
+| 8 | 8 | `send_ts_us` | uint64, big-endian. Microseconds since the Unix epoch (wall clock), taken right before the message is written to the socket. |
+| 16 | N | payload | OPUS mode: one OPUS packet. PCM mode: L16 audio; one message may hold several 20ms frames. |
+
+Notes:
+- When the header is enabled, the WebSocket upgrade request also carries `X-Audio-Fork-Timestamp-Header: 1` (the value is the header version). A server can use it to decide at connect time whether to unwrap binary messages.
+- Text frames (metadata, `send_text`, mark events) are never wrapped.
+- The zero-length binary frame sent on `graceful-shutdown` stays zero-length, with no header.
+- Incoming (bidirectional) binary audio is not affected.
+- `send_ts_us` comes from the FreeSWITCH host's clock. Comparing it with the receiver's clock needs NTP/chrony-synced hosts.
 
 ### Build dependencies
 

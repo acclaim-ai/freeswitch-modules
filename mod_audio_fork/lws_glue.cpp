@@ -609,10 +609,13 @@ namespace {
     strncpy(tech_pvt->bugname, bugname, MAX_BUG_LEN);
     if (metadata) strncpy(tech_pvt->initialMetadata, metadata, MAX_METADATA_LEN);
     
-    size_t buflen = LWS_PRE + (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * 1000 / RTP_PACKETIZATION_PERIOD * nAudioBufferSecs);
+    size_t buflen = FRAME_SIZE_8000 * desiredSampling / 8000 * channels * 1000 / RTP_PACKETIZATION_PERIOD * nAudioBufferSecs;
 
-    drachtio::AudioPipe* ap = new drachtio::AudioPipe(tech_pvt->sessionId, host, port, path, sslFlags, 
-      buflen, read_impl.decoded_bytes_per_packet, username, password, bugname, bidirectional_audio_stream_enable, eventCallback);
+    int timestamp_header = switch_true(switch_channel_get_variable(channel, "AUDIO_FORK_TIMESTAMP_HEADER"));
+
+    drachtio::AudioPipe* ap = new drachtio::AudioPipe(tech_pvt->sessionId, host, port, path, sslFlags,
+      buflen, read_impl.decoded_bytes_per_packet, username, password, bugname, bidirectional_audio_stream_enable,
+      timestamp_header, eventCallback);
     if (!ap) {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error allocating AudioPipe\n");
       return SWITCH_STATUS_FALSE;
@@ -1262,7 +1265,7 @@ extern "C" {
             }
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) dropping packets!\n", 
               tech_pvt->id);
-            pAudioPipe->binaryWritePtrResetToZero();
+            pAudioPipe->binaryWritePtrReset();
 
             frame.data = pAudioPipe->binaryWritePtr();
             frame.buflen = available = pAudioPipe->binarySpaceAvailable();
@@ -1285,7 +1288,7 @@ extern "C" {
         frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
         while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS) {
           if (frame.datalen) {
-            spx_uint32_t out_len = available >> 1;  // space for samples which are 2 bytes
+            spx_uint32_t out_len = available / (2 * tech_pvt->channels);  // per-channel frames of 2-byte samples
             spx_uint32_t in_len = frame.samples;
 
             speex_resampler_process_interleaved_int(tech_pvt->resampler, 

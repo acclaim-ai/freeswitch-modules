@@ -1,12 +1,14 @@
 #ifndef __AUDIO_PIPE_HPP__
 #define __AUDIO_PIPE_HPP__
 
+#include <cstdint>
 #include <string>
 #include <list>
 #include <mutex>
 #include <queue>
 #include <unordered_map>
 #include <thread>
+#include <vector>
 
 #include <libwebsockets.h>
 
@@ -44,9 +46,9 @@ namespace drachtio {
     static bool lws_service_thread();
 
     // constructor
-    AudioPipe(const char* uuid, const char* host, unsigned int port, const char* path, int sslFlags, 
+    AudioPipe(const char* uuid, const char* host, unsigned int port, const char* path, int sslFlags,
       size_t bufLen, size_t minFreespace, const char* username, const char* password, char* bugname,
-      int bidirectional_audio, notifyHandler_t callback);
+      int bidirectional_audio, int timestamp_header, notifyHandler_t callback);
     ~AudioPipe();  
 
     LwsState_t getLwsState(void) { return m_state; }
@@ -64,8 +66,8 @@ namespace drachtio {
     void binaryWritePtrAdd(size_t len) {
       m_audio_buffer_write_offset += len;
     }
-    void binaryWritePtrResetToZero(void) {
-      m_audio_buffer_write_offset = 0;
+    void binaryWritePtrReset(void) {
+      m_audio_buffer_write_offset = dataStartOffset();
     }
     void lockAudioBuffer(void) {
       m_audio_mutex.lock();
@@ -127,6 +129,16 @@ namespace drachtio {
     
     bool connect_client(struct lws_per_vhost_data *vhd);
 
+    // big-endian: version u8, header_len u8, reserved u16, seq u32, send time u64 (epoch us)
+    static const uint8_t TS_HEADER_VERSION = 1;
+    static const size_t TS_HEADER_LEN = 16;
+
+    size_t dataStartOffset(void) const {
+      return LWS_PRE + m_ts_header_len;
+    }
+
+    int sendBinary(struct lws *wsi, uint8_t *msg, size_t len);
+
     LwsState_t m_state;
     std::string m_uuid;
     std::string m_host;
@@ -153,6 +165,8 @@ namespace drachtio {
     bool m_gracefulShutdown;
     bool m_bidirectional_audio_stream;
     std::queue<std::vector<uint8_t>> m_binary_packet_queue;
+    const size_t m_ts_header_len;
+    uint32_t m_ts_header_seq;  // lws service thread only
   };
 
 } // namespace drachtio
