@@ -1,5 +1,14 @@
 # mod_audio_fork
 
+> **Modified version.** This module is modified from the original [jambonz/freeswitch-modules](https://github.com/jambonz/freeswitch-modules) `mod_audio_fork`. Changes started in 2025-06, and the latest is from 2026-11-24. They include:
+>
+> - OPUS mode
+> - a standalone Makefile
+> - session cleanup and thread-leak fixes
+> - the opt-in timestamp header
+>
+> See the git history for the full list. It is distributed under the AGPL-3.0; see [COPYING](../COPYING.md).
+
 A Freeswitch module that attaches a bug to a media server endpoint and streams audio via websockets to a remote server. Supports two modes:
 
 - **PCM mode** (default) — streams L16 (16-bit linear PCM) audio
