@@ -1,6 +1,6 @@
 # mod_audio_fork
 
-> **Modified version.** This module is modified from the original [jambonz/freeswitch-modules](https://github.com/jambonz/freeswitch-modules) `mod_audio_fork`. Changes started in 2025-06, and the latest is from 2026-11-24. They include:
+> **Modified version.** This module is modified from the original [jambonz/freeswitch-modules](https://github.com/jambonz/freeswitch-modules) `mod_audio_fork`. Changes started in 2025-06, and the latest is from 2026-11-26. They include:
 >
 > - OPUS mode
 > - a standalone Makefile

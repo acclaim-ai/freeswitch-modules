@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <ctime>
 #include <iostream>
 
 /* discard incoming text messages over the socket that are longer than this */
@@ -615,8 +616,10 @@ int AudioPipe::sendBinary(struct lws *wsi, uint8_t *msg, size_t len) {
     msg[1] = TS_HEADER_LEN;
     lws_ser_wu16be(msg + 2, 0);
     lws_ser_wu32be(msg + 4, m_ts_header_seq++);
-    // not switch_micro_time_now(): that can be a cached ~1ms timer value
-    lws_ser_wu64be(msg + 8, (uint64_t) switch_time_now());
+    // CLOCK_REALTIME, not switch_time_now(): that is monotonic + last-sync offset
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    lws_ser_wu64be(msg + 8, (uint64_t) ts.tv_sec * 1000000 + ts.tv_nsec / 1000);
   }
   return lws_write(wsi, msg, len, LWS_WRITE_BINARY);
 }
